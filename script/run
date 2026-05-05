@@ -21,6 +21,8 @@ OS_TYPE="$(uname -s)"
 FEATURES="gui"
 
 ./script/install_channel_config || echo "Skipping internal channel config installation (no repo access)."
+echo "Checking common agent skills version..."
+./script/install_common_skills --if-needed --non-interactive --quiet || echo "Skipping common-skills update."
 
 # If warp_channel_config is on PATH, build the Local channel binary; otherwise build the OSS channel.
 if command -v warp-channel-config &>/dev/null; then
