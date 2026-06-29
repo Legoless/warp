@@ -2419,8 +2419,7 @@ pub(crate) fn initialize_app(
     if matches!(
         launch_mode,
         LaunchMode::App { .. } | LaunchMode::Test { .. }
-    ) && FeatureFlag::WarpControlCli.is_enabled()
-    {
+    ) {
         ctx.add_singleton_model(local_control::LocalControlBridge::new);
         ctx.add_singleton_model(local_control::LocalControlServer::new);
     }

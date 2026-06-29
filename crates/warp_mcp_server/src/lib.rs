@@ -18,6 +18,8 @@ use serde_json::{Value, json};
 use warp_core::channel::ChannelState;
 
 pub const MCP_SERVER_MODE_FLAG: &str = "--warp-mcp-server";
+pub const DEFAULT_INSTANCE_ID_ENV: &str = "WARP_MCP_DEFAULT_INSTANCE_ID";
+pub const DEFAULT_PID_ENV: &str = "WARP_MCP_DEFAULT_PID";
 
 #[derive(Debug, Clone)]
 pub struct WarpMcpServer {
@@ -112,6 +114,67 @@ impl WarpMcpServer {
             )
             .await,
         )
+    }
+
+    #[tool(
+        name = "active_context",
+        description = "Return the active Warp context plus windows, tabs, panes, and sessions for resolving targets before acting."
+    )]
+    pub async fn active_context(
+        &self,
+        Parameters(params): Parameters<TargetOnlyParams>,
+    ) -> CallToolResult {
+        let result = async {
+            let active = call_action_with_params(
+                ActionKind::AppActive,
+                EmptyParams {},
+                params.target.clone(),
+                params.instance_id.clone(),
+                params.pid,
+            )
+            .await?;
+            let windows = call_action_with_params(
+                ActionKind::WindowList,
+                EmptyParams {},
+                params.target.clone(),
+                params.instance_id.clone(),
+                params.pid,
+            )
+            .await?;
+            let tabs = call_action_with_params(
+                ActionKind::TabList,
+                EmptyParams {},
+                params.target.clone(),
+                params.instance_id.clone(),
+                params.pid,
+            )
+            .await?;
+            let panes = call_action_with_params(
+                ActionKind::PaneList,
+                EmptyParams {},
+                params.target.clone(),
+                params.instance_id.clone(),
+                params.pid,
+            )
+            .await?;
+            let sessions = call_action_with_params(
+                ActionKind::SessionList,
+                EmptyParams {},
+                params.target,
+                params.instance_id,
+                params.pid,
+            )
+            .await?;
+            Ok(json!({
+                "active": active,
+                "windows": windows,
+                "tabs": tabs,
+                "panes": panes,
+                "sessions": sessions,
+            }))
+        }
+        .await;
+        tool_result(result)
     }
 
     #[tool(name = "list_windows", description = "List Warp windows.")]
@@ -346,7 +409,7 @@ impl WarpMcpServer {
 impl ServerHandler for WarpMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions("Control the running local Warp app through Warp local-control. Use warp_control for any catalog action, or the focused helper tools for common window, tab, pane, block, and terminal key operations.")
+            .with_instructions("Control the running local Warp app through Warp local-control. Start pane-targeted tasks with active_context so the active tab, panes, and sessions are visible before acting. Use returned ids/selectors with the focused helper tools or warp_control. Do not fall back to shell process discovery, osascript, or GUI automation; if Warp MCP returns an error, report that error.")
     }
 }
 
@@ -536,6 +599,20 @@ fn instance_selector(
     instance_id: Option<String>,
     pid: Option<u32>,
 ) -> Result<InstanceSelector, ControlError> {
+    instance_selector_with_defaults(
+        instance_id,
+        pid,
+        default_instance_id_from_env(),
+        default_pid_from_env()?,
+    )
+}
+
+fn instance_selector_with_defaults(
+    instance_id: Option<String>,
+    pid: Option<u32>,
+    default_instance_id: Option<String>,
+    default_pid: Option<u32>,
+) -> Result<InstanceSelector, ControlError> {
     match (instance_id, pid) {
         (Some(_), Some(_)) => Err(ControlError::new(
             ErrorCode::InvalidSelector,
@@ -543,8 +620,40 @@ fn instance_selector(
         )),
         (Some(instance_id), None) => Ok(InstanceSelector::Id(InstanceId(instance_id))),
         (None, Some(pid)) => Ok(InstanceSelector::Pid(pid)),
-        (None, None) => Ok(InstanceSelector::Active),
+        (None, None) => match (default_instance_id, default_pid) {
+            (Some(_), Some(_)) => Err(ControlError::new(
+                ErrorCode::InvalidSelector,
+                format!("{DEFAULT_INSTANCE_ID_ENV} and {DEFAULT_PID_ENV} cannot both be set"),
+            )),
+            (Some(instance_id), None) => Ok(InstanceSelector::Id(InstanceId(instance_id))),
+            (None, Some(pid)) => Ok(InstanceSelector::Pid(pid)),
+            (None, None) => Ok(InstanceSelector::Active),
+        },
     }
+}
+
+fn default_instance_id_from_env() -> Option<String> {
+    std::env::var(DEFAULT_INSTANCE_ID_ENV)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn default_pid_from_env() -> Result<Option<u32>, ControlError> {
+    let Some(value) = std::env::var(DEFAULT_PID_ENV)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    value.parse::<u32>().map(Some).map_err(|err| {
+        ControlError::with_details(
+            ErrorCode::InvalidSelector,
+            format!("{DEFAULT_PID_ENV} must be a process id"),
+            err.to_string(),
+        )
+    })
 }
 
 fn parse_target(target: Option<Value>) -> Result<TargetSelector, ControlError> {
@@ -613,4 +722,45 @@ pub fn run_stdio_blocking() -> anyhow::Result<()> {
             .map_err(|err| anyhow::anyhow!("Warp MCP server task failed: {err}"))?;
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_instance_selector_rejects_conflicting_fields() {
+        let err = instance_selector_with_defaults(Some("inst_1".to_owned()), Some(123), None, None)
+            .expect_err("explicit instance_id and pid should conflict");
+
+        assert_eq!(err.code, ErrorCode::InvalidSelector);
+    }
+
+    #[test]
+    fn instance_selector_uses_default_pid_when_no_explicit_selector() {
+        let selector = instance_selector_with_defaults(None, None, None, Some(123))
+            .expect("default pid should select pid");
+
+        assert_eq!(selector, InstanceSelector::Pid(123));
+    }
+
+    #[test]
+    fn explicit_selector_overrides_default_pid() {
+        let selector =
+            instance_selector_with_defaults(Some("inst_1".to_owned()), None, None, Some(123))
+                .expect("explicit instance id should win");
+
+        assert_eq!(
+            selector,
+            InstanceSelector::Id(InstanceId("inst_1".to_owned()))
+        );
+    }
+
+    #[test]
+    fn default_selector_rejects_conflicting_env_defaults() {
+        let err = instance_selector_with_defaults(None, None, Some("inst_1".to_owned()), Some(123))
+            .expect_err("default instance id and pid should conflict");
+
+        assert_eq!(err.code, ErrorCode::InvalidSelector);
+    }
 }

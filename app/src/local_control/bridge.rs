@@ -13,7 +13,7 @@ use crate::local_control::handlers::{
     app_state, blocks, close, metadata, metadata_config, settings_surfaces,
 };
 use crate::local_control::permissions::{
-    ensure_action_allowed, ensure_feature_enabled, ensure_protocol_version,
+    ensure_action_allowed, ensure_control_runtime_enabled, ensure_protocol_version,
 };
 use crate::local_control::resolver::{validate_action_params, validate_action_target};
 
@@ -43,7 +43,7 @@ impl LocalControlBridge {
         grant: CredentialGrant,
         ctx: &mut ModelContext<Self>,
     ) -> ResponseEnvelope {
-        if let Err(error) = ensure_feature_enabled() {
+        if let Err(error) = ensure_control_runtime_enabled(ctx) {
             return ResponseEnvelope::error(request.request_id, error);
         }
         if let Err(error) = ensure_protocol_version(request.protocol_version) {

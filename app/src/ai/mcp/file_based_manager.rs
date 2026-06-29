@@ -107,11 +107,17 @@ impl FileBasedMCPManager {
                 return;
             }
         };
+        let mut env = serde_json::Map::new();
+        env.insert(
+            warp_mcp_server::DEFAULT_PID_ENV.to_owned(),
+            serde_json::Value::String(std::process::id().to_string()),
+        );
         let config = serde_json::json!({
             "mcpServers": {
                 "warp-control": {
                     "command": command.to_string_lossy().into_owned(),
                     "args": [warp_mcp_server::MCP_SERVER_MODE_FLAG],
+                    "env": env,
                 }
             }
         });

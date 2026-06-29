@@ -462,6 +462,15 @@ fn test_builtin_warp_control_server_is_global_warp_and_auto_spawns() {
                 vec![root_path.clone()]
             );
             assert!(template_json.contains(warp_mcp_server::MCP_SERVER_MODE_FLAG));
+            assert!(template_json.contains(warp_mcp_server::DEFAULT_PID_ENV));
+            let expected_pid = std::process::id().to_string();
+            assert_eq!(
+                installation
+                    .variable_values()
+                    .get(warp_mcp_server::DEFAULT_PID_ENV)
+                    .map(|value| value.value.as_str()),
+                Some(expected_pid.as_str())
+            );
         });
 
         events.update(&mut app, |e, _| {
