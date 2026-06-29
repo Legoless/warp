@@ -8,9 +8,9 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use ::local_control::protocol::{
-    Direction as ControlDirection, DirectionParams, FileOpenParams, PageQueryParams, QueryParams,
-    ResizeParams, TabActivateParams, TabActivationMode, TabCreateParams, TabTarget, TabType,
-    TargetSelector, TextParams,
+    Direction as ControlDirection, DirectionParams, FileOpenParams, KeySequenceParams,
+    PageQueryParams, QueryParams, ResizeParams, TabActivateParams, TabActivationMode,
+    TabCreateParams, TabTarget, TabType, TargetSelector, TextParams,
 };
 use ::local_control::{ActionKind, ControlError, ErrorCode, InstanceId};
 use serde_json::json;
@@ -18,6 +18,7 @@ use warp_util::path::LineAndColumnArg;
 #[cfg(feature = "local_fs")]
 use warpui::SingletonEntity;
 use warpui::{AppContext, ModelContext, TypedActionView};
+use warpui_core::keymap::Keystroke;
 
 #[cfg(feature = "local_fs")]
 use crate::code::editor_management::CodeSource;
@@ -34,6 +35,8 @@ use crate::palette::PaletteMode;
 use crate::pane_group::{ActivationReason, Direction, PaneGroupAction};
 use crate::server::telemetry::PaletteSource;
 use crate::settings_view::SettingsSection;
+use crate::terminal::model::escape_sequences::{KeystrokeWithDetails, ToEscapeSequence, C0};
+use crate::terminal::model::TerminalModel;
 #[cfg(feature = "local_fs")]
 use crate::util::file::external_editor::EditorSettings;
 #[cfg(feature = "local_fs")]
@@ -108,6 +111,7 @@ pub(crate) fn handle(
         ActionKind::SessionReopenClosed => session_reopen_closed(instance_id, target, ctx),
         ActionKind::InputInsert => input_text(instance_id, action, params, target, false, ctx),
         ActionKind::InputReplace => input_text(instance_id, action, params, target, true, ctx),
+        ActionKind::InputSendKeys => input_send_keys(instance_id, params, target, ctx),
         ActionKind::SurfaceSettingsOpen => surface_settings_open(instance_id, params, target, ctx),
         ActionKind::SurfaceCommandPaletteOpen => surface_palette_open(
             instance_id,
@@ -635,6 +639,110 @@ fn input_text(
         });
     });
     Ok(ack(instance_id, action_kind))
+}
+
+fn input_send_keys(
+    instance_id: &Option<InstanceId>,
+    params: &serde_json::Value,
+    target: &TargetSelector,
+    ctx: &mut ModelContext<LocalControlBridge>,
+) -> Result<serde_json::Value, ControlError> {
+    let action_kind = ActionKind::InputSendKeys;
+    let params = decode_params::<KeySequenceParams>(params)?;
+    let pane_group = target_pane_group(action_kind, target, ctx)?;
+    let pane_id = input_target_pane_id(action_kind, target, &pane_group, ctx)?;
+    let terminal_view = pane_group
+        .read(ctx, |pane_group, ctx| {
+            pane_group.terminal_view_from_pane_id(pane_id, ctx)
+        })
+        .ok_or_else(|| {
+            ControlError::new(
+                ErrorCode::MissingTarget,
+                format!("{} requires a terminal input target", action_kind.as_str()),
+            )
+        })?;
+    terminal_view.update(ctx, |terminal_view, ctx| {
+        let bytes = {
+            let model = terminal_view.model.lock();
+            key_sequence_to_bytes(action_kind, &params, &model)?
+        };
+        terminal_view.write_to_pty(bytes, ctx);
+        Ok::<_, ControlError>(())
+    })?;
+    Ok(ack(instance_id, action_kind))
+}
+
+fn key_sequence_to_bytes(
+    action: ActionKind,
+    params: &KeySequenceParams,
+    model: &TerminalModel,
+) -> Result<Vec<u8>, ControlError> {
+    let mut bytes = Vec::new();
+    if let Some(text) = params.text.as_ref() {
+        bytes.extend_from_slice(text.as_bytes());
+    }
+    for key in &params.keys {
+        bytes.extend(bytes_for_keystroke(action, key, model)?);
+    }
+    Ok(bytes)
+}
+
+fn bytes_for_keystroke(
+    action: ActionKind,
+    key: &str,
+    model: &TerminalModel,
+) -> Result<Vec<u8>, ControlError> {
+    let keystroke = parse_control_keystroke(action, key)?;
+    if let Some(escape_sequence) = (KeystrokeWithDetails {
+        keystroke: &keystroke,
+        key_without_modifiers: None,
+        chars: None,
+    })
+    .to_escape_sequence(model)
+    {
+        return Ok(escape_sequence);
+    }
+    if is_printable_keystroke(&keystroke) {
+        return Ok(keystroke.key.as_bytes().to_vec());
+    }
+    match keystroke.key.as_str() {
+        "enter" | "numpadenter" if keystroke.is_unmodified() => Ok(vec![C0::CR]),
+        "tab" if keystroke.is_unmodified() => Ok(vec![C0::HT]),
+        "escape" if keystroke.is_unmodified() => Ok(vec![C0::ESC]),
+        "backspace" if !keystroke.ctrl && !keystroke.alt && !keystroke.meta && !keystroke.cmd => {
+            Ok(vec![C0::DEL])
+        }
+        _ => Err(ControlError::new(
+            ErrorCode::InvalidParams,
+            format!(
+                "{} could not convert key `{key}` to terminal input bytes",
+                action.as_str()
+            ),
+        )),
+    }
+}
+
+fn parse_control_keystroke(action: ActionKind, key: &str) -> Result<Keystroke, ControlError> {
+    match std::panic::catch_unwind(|| Keystroke::parse(key)) {
+        Ok(Ok(keystroke)) => Ok(keystroke),
+        Ok(Err(err)) => Err(ControlError::with_details(
+            ErrorCode::InvalidParams,
+            format!("{} received an invalid key sequence entry", action.as_str()),
+            err.to_string(),
+        )),
+        Err(_) => Err(ControlError::new(
+            ErrorCode::InvalidParams,
+            format!("{} received an invalid key sequence entry", action.as_str()),
+        )),
+    }
+}
+
+fn is_printable_keystroke(keystroke: &Keystroke) -> bool {
+    !keystroke.ctrl
+        && !keystroke.alt
+        && !keystroke.meta
+        && !keystroke.cmd
+        && keystroke.key.chars().count() == 1
 }
 
 pub(super) fn validate_staged_input_text(

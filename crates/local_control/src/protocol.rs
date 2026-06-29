@@ -71,6 +71,47 @@ pub struct BindingNameParams {
     pub binding_name: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlockQueryParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub include_hidden: bool,
+    #[serde(default)]
+    pub include_output: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_chars: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlockReadParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<u32>,
+    #[serde(default = "default_include_block_output")]
+    pub include_output: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_chars: Option<usize>,
+}
+
+impl Default for BlockReadParams {
+    fn default() -> Self {
+        Self {
+            block_id: None,
+            index: None,
+            include_output: true,
+            max_output_chars: None,
+        }
+    }
+}
+
+fn default_include_block_output() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BooleanValueParams {
@@ -178,6 +219,15 @@ pub struct TabCreateParams {
 #[serde(deny_unknown_fields)]
 pub struct TextParams {
     pub text: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeySequenceParams {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -707,6 +707,11 @@ pub fn run() -> Result<()> {
         warp_util::windows::attach_to_parent_console();
         warp_cli::local_control::run_and_exit(args);
     }
+    if std::env::args().any(|arg| arg == warp_mcp_server::MCP_SERVER_MODE_FLAG) {
+        #[cfg(windows)]
+        warp_util::windows::attach_to_parent_console();
+        return warp_mcp_server::run_stdio_blocking();
+    }
 
     // Parse command-line arguments.
     let args = warp_cli::Args::from_env();
