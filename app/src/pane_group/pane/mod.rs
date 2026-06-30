@@ -32,6 +32,7 @@ pub mod workflow_pane;
 use std::any::Any;
 use std::fmt::Display;
 
+use pathfinder_color::ColorU;
 use serde::{Deserialize, Serialize};
 use url::Url;
 use warp_util::remote_path::RemotePath;
@@ -696,6 +697,12 @@ pub struct PaneConfiguration {
     /// If true, we draw an accent border around the pane.
     show_accent_border: bool,
 
+    /// If set, tint the pane with this activity color.
+    activity_color: Option<ColorU>,
+
+    /// If true, avoid applying overlays above pane content.
+    preserve_content_colors: bool,
+
     /// Pane views set this when they have an open modal. We dim the pane header along with the
     /// pane contents.
     has_open_modal: bool,
@@ -720,6 +727,8 @@ impl PaneConfiguration {
             custom_vertical_tabs_title: None,
             show_active_pane_indicator: false,
             show_accent_border: false,
+            activity_color: None,
+            preserve_content_colors: false,
             has_open_modal: false,
             dim_even_if_focused: false,
             header_left_inset: 0.,
@@ -740,6 +749,14 @@ impl PaneConfiguration {
 
     pub fn dim_even_if_focused(&self) -> bool {
         self.dim_even_if_focused
+    }
+
+    pub fn activity_color(&self) -> Option<ColorU> {
+        self.activity_color
+    }
+
+    pub fn preserve_content_colors(&self) -> bool {
+        self.preserve_content_colors
     }
 
     pub fn set_show_active_pane_indicator(
@@ -814,6 +831,28 @@ impl PaneConfiguration {
         ctx.emit(PaneConfigurationEvent::ShowAccentBorderUpdated);
     }
 
+    pub fn set_activity_color(
+        &mut self,
+        activity_color: Option<ColorU>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if self.activity_color != activity_color {
+            self.activity_color = activity_color;
+            ctx.emit(PaneConfigurationEvent::ActivityColorUpdated);
+        }
+    }
+
+    pub fn set_preserve_content_colors(
+        &mut self,
+        preserve_content_colors: bool,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if self.preserve_content_colors != preserve_content_colors {
+            self.preserve_content_colors = preserve_content_colors;
+            ctx.emit(PaneConfigurationEvent::PreserveContentColorsUpdated);
+        }
+    }
+
     pub fn set_has_open_modal(&mut self, has_open_modal: bool, ctx: &mut ModelContext<Self>) {
         self.has_open_modal = has_open_modal;
         ctx.emit(PaneConfigurationEvent::OpenModalUpdated);
@@ -873,6 +912,8 @@ pub enum PaneConfigurationEvent {
     ShowActivePaneIndicatorUpdated,
     RenderElementFnUpdated,
     ShowAccentBorderUpdated,
+    ActivityColorUpdated,
+    PreserveContentColorsUpdated,
     OpenModalUpdated,
     RefreshPaneHeaderOverflowMenuItems,
     ShareableObjectChanged(Option<ShareableObject>),

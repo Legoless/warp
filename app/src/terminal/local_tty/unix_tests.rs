@@ -64,6 +64,40 @@ fn host_non_bash_command_does_not_set_history_size_sentinels() {
 }
 
 #[test]
+fn host_command_forces_interactive_terminal_color_environment() {
+    let command = build_host_shell_command(
+        shell_starter(ShellType::Zsh, "/bin/zsh"),
+        None,
+        HashMap::from([
+            (OsString::from("TERM"), OsString::from("dumb")),
+            (OsString::from("COLORTERM"), OsString::from("")),
+            (OsString::from("TERM_PROGRAM"), OsString::from("Codex")),
+            (OsString::from("NO_COLOR"), OsString::from("1")),
+        ]),
+        None,
+        false,
+        false,
+        false,
+        false,
+        true,
+    );
+
+    assert_eq!(
+        env_value(&command, "TERM"),
+        Some(Some("xterm-256color".to_owned()))
+    );
+    assert_eq!(
+        env_value(&command, "TERM_PROGRAM"),
+        Some(Some("WarpTerminal".to_owned()))
+    );
+    assert_eq!(
+        env_value(&command, "COLORTERM"),
+        Some(Some("truecolor".to_owned()))
+    );
+    assert_eq!(env_value(&command, "NO_COLOR"), Some(None));
+}
+
+#[test]
 fn docker_sandbox_command_sets_history_size_sentinels() {
     let docker_starter =
         DockerSandboxShellStarter::new(shell_starter(ShellType::Bash, "sbx"), None);
@@ -94,4 +128,39 @@ fn docker_sandbox_command_sets_history_size_sentinels() {
         env_value(&command, "WARP_INITIAL_HISTSIZE"),
         Some(Some(BASH_HISTORY_SIZE_SENTINEL.to_owned()))
     );
+}
+
+#[test]
+fn docker_sandbox_command_forces_interactive_terminal_color_environment() {
+    let docker_starter =
+        DockerSandboxShellStarter::new(shell_starter(ShellType::Bash, "sbx"), None);
+    let command = build_docker_sandbox_command(
+        &docker_starter,
+        None,
+        HashMap::from([
+            (OsString::from("TERM"), OsString::from("dumb")),
+            (OsString::from("COLORTERM"), OsString::from("")),
+            (OsString::from("TERM_PROGRAM"), OsString::from("Codex")),
+            (OsString::from("NO_COLOR"), OsString::from("1")),
+        ]),
+        false,
+        false,
+        false,
+        false,
+        true,
+    );
+
+    assert_eq!(
+        env_value(&command, "TERM"),
+        Some(Some("xterm-256color".to_owned()))
+    );
+    assert_eq!(
+        env_value(&command, "TERM_PROGRAM"),
+        Some(Some("WarpTerminal".to_owned()))
+    );
+    assert_eq!(
+        env_value(&command, "COLORTERM"),
+        Some(Some("truecolor".to_owned()))
+    );
+    assert_eq!(env_value(&command, "NO_COLOR"), Some(None));
 }

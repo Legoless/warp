@@ -7,10 +7,16 @@ pub use header::PaneHeaderAction::CustomAction as PaneHeaderCustomAction;
 pub use header_content::{
     HeaderContent, HeaderRenderContext, StandardHeader, StandardHeaderOptions,
 };
+use pathfinder_color::ColorU;
 use pathfinder_geometry::rect::RectF;
+use pathfinder_geometry::vector::vec2f;
+use warp_core::ui::color::blend::Blend;
+use warp_core::ui::color::coloru_with_opacity;
+use warp_core::ui::theme::Fill as ThemeFill;
 use warpui::elements::{
-    Border, ConstrainedBox, Container, DropTarget, DropTargetData, Flex, MainAxisSize,
-    ParentElement, SavePosition, Shrinkable,
+    Border, ChildAnchor, ConstrainedBox, Container, DropTarget, DropTargetData, Flex, MainAxisSize,
+    OffsetPositioning, ParentAnchor, ParentElement, ParentOffsetBounds, Rect, SavePosition,
+    Shrinkable, Stack,
 };
 use warpui::keymap::EditableBinding;
 use warpui::presenter::ChildView;
@@ -31,6 +37,11 @@ use crate::settings::{PaneSettings, PaneSettingsChangedEvent};
 use crate::util::bindings::CustomAction;
 
 const HAS_SHARED_OBJECT_CONTEXT_KEY: &str = "PaneView_HasSharedObject";
+/// Subtle full-pane tint for block-list panes.
+const PANE_ACTIVITY_TINT_OPACITY: u8 = 12;
+/// Stronger chrome tint for panes whose terminal content must stay untouched.
+const PANE_HEADER_ACTIVITY_TINT_OPACITY: u8 = 50;
+const PANE_ACTIVITY_STRIP_HEIGHT: f32 = 2.;
 
 /// Max width applied to the pane header while the pane renders as a floating drag preview.
 /// During a pane drag the pane is laid out with unbounded constraints; `MainAxisSize::Min`
@@ -122,6 +133,7 @@ impl<P: BackingView> PaneView<P> {
             if matches!(
                 event,
                 PaneSettingsChangedEvent::ShouldDimInactivePanes { .. }
+                    | PaneSettingsChangedEvent::PaneActivityBackground { .. }
             ) {
                 ctx.notify();
             }
@@ -235,6 +247,8 @@ impl<P: BackingView> PaneView<P> {
     ) {
         match event {
             PaneConfigurationEvent::ShowAccentBorderUpdated
+            | PaneConfigurationEvent::ActivityColorUpdated
+            | PaneConfigurationEvent::PreserveContentColorsUpdated
             | PaneConfigurationEvent::DimEvenIfFocusedUpdated => ctx.notify(),
             PaneConfigurationEvent::RefreshPaneHeaderOverflowMenuItems => {
                 let child = self.child(ctx);
@@ -400,11 +414,38 @@ impl<P: BackingView> View for PaneView<P> {
 
         let active_child = self.child(app);
 
+        let activity_color = pane_configuration.activity_color();
+        let preserve_content_colors = pane_configuration.preserve_content_colors();
+        let pane_settings = PaneSettings::as_ref(app);
+
+        let inactive_overlay = (*pane_settings.should_dim_inactive_panes
+            && (pane_configuration.dim_even_if_focused()
+                || (split_pane_state.is_in_split_pane() && !split_pane_state.is_focused())))
+        .then(|| appearance.theme().inactive_pane_overlay());
+        let should_tint_activity_background = *pane_settings.pane_activity_background;
+
+        let should_render_header =
+            active_child.as_ref(app).should_render_header(app) || self.is_being_dragged;
+        let preserved_content_activity_chrome = if preserve_content_colors {
+            pane_preserved_content_activity_chrome(
+                appearance.theme().background(),
+                activity_color,
+                inactive_overlay,
+            )
+        } else {
+            None
+        };
+
         // If being dragged, we must render the pane header, since that's what receives drag events.
         // Otherwise, if we stop rendering the header partway through a drag, the pane will be stuck
         // in its dragged state.
-        if active_child.as_ref(app).should_render_header(app) || self.is_being_dragged {
-            column.add_child(ChildView::new(&self.header).finish());
+        if should_render_header {
+            let header: Box<dyn Element> = ChildView::new(&self.header).finish();
+            let header = match preserved_content_activity_chrome {
+                Some(background) => Container::new(header).with_background(background).finish(),
+                None => header,
+            };
+            column.add_child(header);
         }
 
         // Add the underlying pane view.
@@ -416,18 +457,16 @@ impl<P: BackingView> View for PaneView<P> {
             container = container.with_border(border);
         }
 
-        // Dim inactive panes.
-        let should_dim_inactive_panes = *PaneSettings::as_ref(app).should_dim_inactive_panes;
-        let dim_even_if_focused = pane_configuration.dim_even_if_focused();
-        if should_dim_inactive_panes {
-            if dim_even_if_focused {
-                // Focus is in a side panel: dim this pane regardless of split state or focus.
-                container =
-                    container.with_foreground_overlay(appearance.theme().inactive_pane_overlay());
-            } else if split_pane_state.is_in_split_pane() && !split_pane_state.is_focused() {
-                // Normal behavior: in a split, dim only unfocused panes.
-                container =
-                    container.with_foreground_overlay(appearance.theme().inactive_pane_overlay());
+        if let Some(background) = pane_activity_background(
+            appearance.theme().background(),
+            activity_color,
+            inactive_overlay,
+            should_tint_activity_background,
+        ) {
+            container = container.with_background(background);
+        } else if !preserve_content_colors {
+            if let Some(overlay) = inactive_overlay {
+                container = container.with_foreground_overlay(overlay);
             }
         }
 
@@ -435,8 +474,15 @@ impl<P: BackingView> View for PaneView<P> {
             container = container.with_foreground_overlay(appearance.theme().surface_2())
         }
 
+        let mut pane: Box<dyn Element> = container.finish();
+        if !should_render_header {
+            if let Some(background) = preserved_content_activity_chrome {
+                pane = pane_with_activity_strip(pane, background);
+            }
+        }
+
         SavePosition::new(
-            DropTarget::new(container.finish(), PaneDropTargetData { id: self.pane_id }).finish(),
+            DropTarget::new(pane, PaneDropTargetData { id: self.pane_id }).finish(),
             &self.pane_id.position_id(),
         )
         .finish()
@@ -464,6 +510,67 @@ impl<P: BackingView> View for PaneView<P> {
         ids
     }
 }
+
+fn pane_activity_background(
+    background: ThemeFill,
+    activity_color: Option<ColorU>,
+    overlay: Option<ThemeFill>,
+    should_tint_activity_background: bool,
+) -> Option<ThemeFill> {
+    if !should_tint_activity_background {
+        return None;
+    }
+
+    activity_color
+        .map(|color| {
+            background.blend(&ThemeFill::Solid(coloru_with_opacity(
+                color,
+                PANE_ACTIVITY_TINT_OPACITY,
+            )))
+        })
+        .map(|background| match overlay {
+            Some(overlay) => background.blend(&overlay),
+            None => background,
+        })
+}
+
+/// Activity chrome for panes whose terminal content must not be tinted.
+fn pane_preserved_content_activity_chrome(
+    background: ThemeFill,
+    activity_color: Option<ColorU>,
+    inactive_overlay: Option<ThemeFill>,
+) -> Option<ThemeFill> {
+    let color = activity_color?;
+    let mut fill =
+        ThemeFill::Solid(background.into_solid_bias_top_color()).blend(&ThemeFill::Solid(
+            coloru_with_opacity(color, PANE_HEADER_ACTIVITY_TINT_OPACITY),
+        ));
+    if let Some(dim) = inactive_overlay {
+        fill = fill.blend(&dim);
+    }
+    Some(fill)
+}
+
+fn pane_with_activity_strip(pane: Box<dyn Element>, background: ThemeFill) -> Box<dyn Element> {
+    let strip = ConstrainedBox::new(Rect::new().with_background(background).finish())
+        .with_height(PANE_ACTIVITY_STRIP_HEIGHT)
+        .finish();
+    let mut stack = Stack::new().with_child(pane);
+    stack.add_positioned_child(
+        strip,
+        OffsetPositioning::offset_from_parent(
+            vec2f(0., 0.),
+            ParentOffsetBounds::ParentBySize,
+            ParentAnchor::TopLeft,
+            ChildAnchor::TopLeft,
+        ),
+    );
+    stack.finish()
+}
+
+#[cfg(test)]
+#[path = "mod_tests.rs"]
+mod tests;
 
 impl<P: BackingView> TypedActionView for PaneView<P> {
     type Action = PaneAction;

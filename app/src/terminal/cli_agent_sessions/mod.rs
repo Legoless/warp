@@ -274,6 +274,10 @@ impl CLIAgentSession {
             CLIAgentEventType::Unknown(_) => return None,
         };
 
+        if self.status == new_status {
+            return None;
+        }
+
         self.status = new_status.clone();
         Some(new_status)
     }
@@ -483,6 +487,40 @@ impl CLIAgentSessionsModel {
                 agent: session.agent,
             });
         }
+    }
+
+    /// Marks an existing CLI agent session as active after Warp submits user
+    /// input to the agent's running TUI. This covers legacy/non-rich sessions
+    /// (notably Codex OSC 9 fallback) where no `prompt_submit` event is emitted.
+    pub fn mark_prompt_submitted_from_user_input(
+        &mut self,
+        terminal_view_id: EntityId,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let Some(session) = self.sessions.get_mut(&terminal_view_id) else {
+            return;
+        };
+        if matches!(session.agent, CLIAgent::Unknown) {
+            return;
+        }
+
+        session.session_context.response = None;
+        session.clear_permission_scoped_state();
+
+        if !matches!(session.status, CLIAgentSessionStatus::InProgress) {
+            session.status = CLIAgentSessionStatus::InProgress;
+            ctx.emit(CLIAgentSessionsModelEvent::StatusChanged {
+                terminal_view_id,
+                agent: session.agent,
+                status: CLIAgentSessionStatus::InProgress,
+                session_context: Box::new(session.session_context.clone()),
+            });
+        }
+
+        ctx.emit(CLIAgentSessionsModelEvent::SessionUpdated {
+            terminal_view_id,
+            agent: session.agent,
+        });
     }
 
     pub fn open_input(

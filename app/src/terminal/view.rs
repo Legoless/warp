@@ -361,15 +361,16 @@ use crate::settings::import::view::{SettingsImportEvent, SettingsImportView};
 use crate::settings::{
     AISettings, AISettingsChangedEvent, AliasExpansionSettings, AppEditorSettings,
     BlockVisibilitySettings, BlockVisibilitySettingsChangedEvent, CodeSettings, DebugSettings,
-    DebugSettingsChangedEvent, EmacsBindingsSettings, FontSettings, FontSettingsChangedEvent,
-    InputModeSettings, InputModeSettingsChangedEvent, InputSettings, PaneSettings,
-    PaneSettingsChangedEvent, PrivacySettings, PrivacySettingsChangedEvent,
+    DebugSettingsChangedEvent, EmacsBindingsSettings, EnforceMinimumContrast, FontSettings,
+    FontSettingsChangedEvent, InputModeSettings, InputModeSettingsChangedEvent, InputSettings,
+    PaneSettings, PaneSettingsChangedEvent, PrivacySettings, PrivacySettingsChangedEvent,
     PrivacySettingsSnapshot, SelectionSettings, VimBannerSettings,
 };
 use crate::settings_view::keybindings::KeybindingChangedNotifier;
 use crate::settings_view::mcp_servers_page::MCPServersSettingsPage;
 use crate::settings_view::{flags, SettingsSection};
 use crate::shell_indicator::ShellIndicatorType;
+use crate::terminal::activity_status::CLI_AGENT_OUTPUT_QUIET_MS;
 use crate::terminal::alias::{check_for_alias_async, AliasedCommand};
 use crate::terminal::alt_screen::alt_screen_element::AltScreenElement;
 use crate::terminal::alt_screen::should_intercept_scroll;
@@ -2857,6 +2858,18 @@ pub struct TerminalView {
     cli_subagent_controller: ModelHandle<CLISubagentController>,
     use_agent_footer: ViewHandle<UseAgentToolbar>,
 
+    /// Last computed CLI-agent output-activity state. Used to refresh the cached
+    /// pane header color from `handle_terminal_wakeup` only on transitions, so a
+    /// non-rich agent like Codex turns red while streaming output and black once
+    /// it goes idle at its prompt.
+    last_cli_agent_output_active: bool,
+
+    /// Pending one-shot task that re-evaluates CLI-agent output activity
+    /// `CLI_AGENT_OUTPUT_QUIET_MS` after the most recent PTY output. Needed
+    /// because `handle_terminal_wakeup` fires only on PTY output, so without it
+    /// the working->idle transition would never refresh the cached header color.
+    cli_agent_activity_refresh: Option<SpawnedFutureHandle>,
+
     agent_view_controller: ModelHandle<AgentViewController>,
     agent_view_back_button: ViewHandle<ActionButton>,
     /// Pill bar shown above the agent view header listing the orchestrator and
@@ -3599,14 +3612,17 @@ impl TerminalView {
             },
         );
 
-        ctx.subscribe_to_model(&PaneSettings::handle(ctx), |_, _, event, ctx| {
-            if matches!(
-                event,
-                PaneSettingsChangedEvent::ShouldDimInactivePanes { .. }
-            ) {
-                ctx.notify();
-            }
-        });
+        ctx.subscribe_to_model(
+            &PaneSettings::handle(ctx),
+            |me, _, event, ctx| match event {
+                PaneSettingsChangedEvent::ShouldDimInactivePanes { .. } => ctx.notify(),
+                PaneSettingsChangedEvent::PaneColorMode { .. }
+                | PaneSettingsChangedEvent::PaneActivityColors { .. } => {
+                    me.update_pane_configuration(ctx);
+                }
+                _ => {}
+            },
+        );
 
         ctx.subscribe_to_model(
             &Appearance::handle(ctx),
@@ -4419,6 +4435,8 @@ impl TerminalView {
             cli_subagent_views: Default::default(),
             cli_subagent_controller,
             use_agent_footer: use_agent_button_bar,
+            last_cli_agent_output_active: false,
+            cli_agent_activity_refresh: None,
             agent_view_controller,
             agent_view_back_button,
             orchestration_pill_bar,
@@ -9338,6 +9356,7 @@ impl TerminalView {
         data: B,
         ctx: &mut ViewContext<Self>,
     ) {
+        let bytes = data.into();
         {
             let mut terminal_model = self.model.lock();
             let active_block = terminal_model.block_list().active_block();
@@ -9353,12 +9372,41 @@ impl TerminalView {
             }
         }
 
-        let bytes = data.into();
+        self.mark_cli_agent_prompt_submitted_from_user_bytes(bytes.as_ref(), ctx);
         let bytes_vec = bytes.to_vec();
         self.clear_selected_blocks(ctx);
         self.update_scroll_position_locking(ScrollPositionUpdate::AfterWriteUserBytesToPty, ctx);
         self.write_to_pty(bytes, ctx);
         self.emit_non_editor_typed_event(bytes_vec, ctx);
+    }
+
+    fn mark_cli_agent_prompt_submitted_from_user_bytes(
+        &mut self,
+        bytes: &[u8],
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if !bytes_submit_cli_agent_prompt(bytes) {
+            return;
+        }
+        if !CLIAgentSessionsModel::as_ref(ctx)
+            .session(self.view_id)
+            .is_some_and(|session| !matches!(session.agent, CLIAgent::Unknown))
+        {
+            return;
+        }
+        if !self
+            .model
+            .lock()
+            .block_list()
+            .active_block()
+            .is_active_and_long_running()
+        {
+            return;
+        }
+
+        CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions_model, ctx| {
+            sessions_model.mark_prompt_submitted_from_user_input(self.view_id, ctx);
+        });
     }
 
     /// Write to the PTY if the session has finished bootstrapping and
@@ -9621,8 +9669,80 @@ impl TerminalView {
             footer.notify_and_notify_children(ctx);
         });
 
+        // Keep the cached pane header color in sync with CLI-agent output
+        // activity. This hook fires both on real PTY output (leading edge ->
+        // red while streaming) and on the periodic long-running-process timer
+        // (trailing edge -> black ~CLI_AGENT_OUTPUT_QUIET_MS after output goes
+        // quiet), so a non-rich agent like Codex shows Working only while it is
+        // actually producing output. Re-render the cached pane config only on a
+        // transition, to avoid redundant updates.
+        let (has_cli_agent, millis_since_output) = {
+            let model = self.model.lock();
+            let has_cli_agent = CLIAgentSessionsModel::as_ref(ctx)
+                .session(self.view_id)
+                .is_some()
+                || self.active_block_has_cli_agent_command(&model, ctx);
+            (has_cli_agent, model.millis_since_last_output())
+        };
+        let cli_agent_output_active =
+            has_cli_agent && millis_since_output.is_some_and(|ms| ms < CLI_AGENT_OUTPUT_QUIET_MS);
+        if cli_agent_output_active != self.last_cli_agent_output_active {
+            self.last_cli_agent_output_active = cli_agent_output_active;
+            self.update_pane_configuration(ctx);
+        }
+        // `handle_terminal_wakeup` only fires on PTY output, so the working->idle
+        // trailing edge has no wakeup to refresh it. Schedule a one-shot timer to
+        // re-evaluate once output goes quiet; while output keeps flowing the timer
+        // is rescheduled (coalesced) and never fires, so an idle non-rich agent
+        // (e.g. Codex) returns to NotWorking after CLI_AGENT_OUTPUT_QUIET_MS.
+        if cli_agent_output_active {
+            self.schedule_cli_agent_activity_refresh(ctx);
+        }
+
         // Need to re-render both the alt screen and the blocklist on keypresses.
         ctx.notify();
+    }
+
+    /// Schedules (or reschedules) the trailing-edge refresh that returns the pane
+    /// header to NotWorking once a non-rich CLI agent (e.g. Codex) stops producing
+    /// output. Coalesces: each call aborts the previous pending timer, so while
+    /// output keeps flowing the timer is pushed forward and never fires.
+    fn schedule_cli_agent_activity_refresh(&mut self, ctx: &mut ViewContext<Self>) {
+        if let Some(handle) = self.cli_agent_activity_refresh.take() {
+            handle.abort();
+        }
+        self.cli_agent_activity_refresh = Some(ctx.spawn(
+            Timer::after(Duration::from_millis(CLI_AGENT_OUTPUT_QUIET_MS as u64 + 50)),
+            move |me, _, ctx| {
+                me.refresh_cli_agent_activity_color(ctx);
+            },
+        ));
+    }
+
+    /// Re-evaluates CLI-agent output activity (driven by the trailing-edge timer
+    /// from [`Self::schedule_cli_agent_activity_refresh`]) and refreshes the cached
+    /// pane header color if it changed, so an idle agent returns to black after
+    /// `CLI_AGENT_OUTPUT_QUIET_MS` of quiet. If output is somehow still active at
+    /// the deadline, it re-arms so the eventual trailing edge is not missed.
+    fn refresh_cli_agent_activity_color(&mut self, ctx: &mut ViewContext<Self>) {
+        self.cli_agent_activity_refresh = None;
+        let (has_cli_agent, millis_since_output) = {
+            let model = self.model.lock();
+            let has_cli_agent = CLIAgentSessionsModel::as_ref(ctx)
+                .session(self.view_id)
+                .is_some()
+                || self.active_block_has_cli_agent_command(&model, ctx);
+            (has_cli_agent, model.millis_since_last_output())
+        };
+        let cli_agent_output_active =
+            has_cli_agent && millis_since_output.is_some_and(|ms| ms < CLI_AGENT_OUTPUT_QUIET_MS);
+        if cli_agent_output_active != self.last_cli_agent_output_active {
+            self.last_cli_agent_output_active = cli_agent_output_active;
+            self.update_pane_configuration(ctx);
+        }
+        if cli_agent_output_active {
+            self.schedule_cli_agent_activity_refresh(ctx);
+        }
     }
 
     /// This function is invoked whenever we detect an SSH ControlMaster error,
@@ -12707,6 +12827,8 @@ impl TerminalView {
                 {
                     self.update_agent_view_back_button_state(ctx);
                 }
+
+                self.update_pane_configuration(ctx);
             }
             ModelEvent::DetectedEndOfSshLogin(check_type) => {
                 self.handle_detected_end_of_ssh_login(check_type, ctx);
@@ -13229,19 +13351,13 @@ impl TerminalView {
             return;
         }
 
-        if notification.agent == CLIAgent::Codex && !FeatureFlag::CodexPlugin.is_enabled() {
-            return;
-        }
-
-        if !self.register_cli_agent_listener_from_event(&notification, ctx) {
-            return;
-        }
+        let did_register_listener = self.register_cli_agent_listener_from_event(&notification, ctx);
 
         CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions_model, ctx| {
             sessions_model.update_from_event(self.view_id, &notification, ctx);
         });
 
-        if notification.event == CLIAgentEventType::SessionStart {
+        if did_register_listener && notification.event == CLIAgentEventType::SessionStart {
             send_telemetry_from_ctx!(
                 TelemetryEvent::CLIAgentPluginDetected {
                     cli_agent: notification.agent.into(),
@@ -23083,9 +23199,12 @@ impl TerminalView {
     fn handle_theme_change(&mut self, ctx: &mut ViewContext<Self>) {
         let appearance = Appearance::as_ref(ctx);
         let colors = color::List::from(&appearance.theme().clone().into());
-        let mut model = self.model.lock();
-        model.update_colors(colors);
+        {
+            let mut model = self.model.lock();
+            model.update_colors(colors);
+        }
         self.colors = colors;
+        self.update_pane_configuration(ctx);
         ctx.notify();
     }
 
@@ -23877,7 +23996,7 @@ impl TerminalView {
         // SizeInfo that reflects the lack of padding on the AltScreenElement directly
         let render_context = self.get_terminal_view_render_context(model, app);
 
-        let enforce_minimum_contrast = *FontSettings::as_ref(app).enforce_minimum_contrast;
+        let enforce_minimum_contrast = self.terminal_grid_enforce_minimum_contrast(model, app);
         let active_cli_subagent_view = model
             .block_list()
             .active_block()
@@ -24061,7 +24180,7 @@ impl TerminalView {
         let terminal_spacing =
             TerminalSettings::as_ref(app).terminal_spacing(appearance.line_height_ratio(), app);
 
-        let enforce_minimum_contrast = *FontSettings::as_ref(app).enforce_minimum_contrast;
+        let enforce_minimum_contrast = self.terminal_grid_enforce_minimum_contrast(model, app);
 
         let mut element = BlockListElement::new(
             self.model.clone(),
@@ -28731,6 +28850,46 @@ fn maybe_wrap_terminal_element_in_scrollable(
         }
         (false, false) => element.finish(),
     }
+}
+
+impl TerminalView {
+    fn terminal_grid_enforce_minimum_contrast(
+        &self,
+        model: &TerminalModel,
+        app: &AppContext,
+    ) -> EnforceMinimumContrast {
+        terminal_grid_enforce_minimum_contrast(
+            *FontSettings::as_ref(app).enforce_minimum_contrast,
+            self.should_preserve_terminal_content_colors_for_rendering(model, app),
+        )
+    }
+
+    fn should_preserve_terminal_content_colors_for_rendering(
+        &self,
+        model: &TerminalModel,
+        app: &AppContext,
+    ) -> bool {
+        model.is_alt_screen_active()
+            || CLIAgentSessionsModel::as_ref(app)
+                .session(self.view_id)
+                .is_some()
+            || self.active_block_has_cli_agent_command(model, app)
+    }
+}
+
+fn terminal_grid_enforce_minimum_contrast(
+    configured: EnforceMinimumContrast,
+    preserve_terminal_content_colors: bool,
+) -> EnforceMinimumContrast {
+    if preserve_terminal_content_colors {
+        EnforceMinimumContrast::Never
+    } else {
+        configured
+    }
+}
+
+fn bytes_submit_cli_agent_prompt(bytes: &[u8]) -> bool {
+    bytes.iter().any(|byte| matches!(byte, b'\r' | b'\n'))
 }
 
 /// Returns `true` when the Rich Input chip is present in the user's CLI agent

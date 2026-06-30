@@ -363,19 +363,55 @@ impl TerminalView {
             return None;
         }
 
+        self.detect_cli_agent_command_from_model(model, ctx)
+    }
+
+    pub(super) fn active_block_has_cli_agent_command(
+        &self,
+        model: &TerminalModel,
+        ctx: &AppContext,
+    ) -> bool {
+        self.detect_cli_agent_from_model(model, ctx).is_some()
+    }
+
+    pub(super) fn block_list_has_cli_agent_command(
+        &self,
+        model: &TerminalModel,
+        ctx: &AppContext,
+    ) -> bool {
+        model.block_list().blocks().iter().any(|block| {
+            if block.is_background() {
+                return false;
+            }
+
+            let command = block.command_with_secrets_obfuscated(false);
+            CLIAgent::detect(&command, None, None, ctx).is_some()
+                || CompiledCommandsForCodingAgentToolbar::matched_agent(ctx, &command).is_some()
+        })
+    }
+
+    fn detect_cli_agent_command_from_model(
+        &self,
+        model: &TerminalModel,
+        ctx: &AppContext,
+    ) -> Option<(CLIAgent, Option<String>)> {
+        let active_block = model.block_list().active_block();
         let command = active_block.command_with_secrets_obfuscated(false);
 
-        let detected = self.active_block_session_id().and_then(|session_id| {
-            self.sessions.read(ctx, |sessions, _| {
-                let session = sessions.get(session_id)?;
-                CLIAgent::detect(
-                    &command,
-                    Some(session.shell_family().escape_char()),
-                    Some(session.aliases()),
-                    ctx,
-                )
+        let detected = self
+            .active_block_session_id()
+            .and_then(|session_id| {
+                self.sessions.read(ctx, |sessions, _| {
+                    let session = sessions.get(session_id)?;
+                    CLIAgent::detect(
+                        &command,
+                        Some(session.shell_family().escape_char()),
+                        Some(session.aliases()),
+                        ctx,
+                    )
+                })
             })
-        });
+            .or_else(|| CLIAgent::detect(&command, None, None, ctx));
 
         if let Some(agent) = detected {
             return Some((agent, None));

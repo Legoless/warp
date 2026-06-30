@@ -1,4 +1,5 @@
 use super::*;
+use crate::features::FeatureFlag;
 use crate::terminal::cli_agent_sessions::event::{
     CLIAgentEventSource, CLIAgentEventType, CLI_AGENT_NOTIFICATION_SENTINEL,
 };
@@ -75,14 +76,16 @@ fn codex_try_parse_ignores_osc9_when_plugin_already_active() {
 }
 
 #[test]
-fn codex_try_parse_ignores_structured_event_without_codex_plugin() {
+fn codex_try_parse_accepts_structured_event_without_codex_plugin() {
     let _guard = FeatureFlag::CodexPlugin.override_enabled(false);
     let mut handler = CodexSessionHandler;
     let body = r#"{"v":1,"agent":"codex","event":"permission_request","summary":"Approve?","tool_name":"Bash"}"#;
 
-    assert!(handler
+    let event = handler
         .try_parse(Some(CLI_AGENT_NOTIFICATION_SENTINEL), body, false)
-        .is_none());
+        .unwrap();
+
+    assert_eq!(event.event, CLIAgentEventType::PermissionRequest);
     assert!(handler
         .try_parse(None, "Agent turn complete", false)
         .is_some());

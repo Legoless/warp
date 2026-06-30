@@ -18,6 +18,7 @@ use warpui::units::{IntoPixels, Lines, Pixels};
 use warpui::{AppContext, WindowId};
 mod block_list_settings;
 
+pub(crate) mod activity_status;
 mod alias;
 pub(crate) mod alt_screen;
 pub mod alt_screen_reporting;

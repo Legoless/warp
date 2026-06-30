@@ -8,6 +8,7 @@ use std::sync::Arc;
 use async_channel::Sender;
 use base64::Engine;
 use hex::FromHexError;
+use instant::Instant;
 use itertools::{Either, Itertools};
 use serde::Serialize;
 use session_sharing_protocol::common::{
@@ -528,6 +529,11 @@ pub struct TerminalModel {
     /// bootstrap init scripts. Used to validate DCS hook integrity: hooks
     /// carrying an unrecognized session_id are rejected.
     registered_session_ids: HashSet<SessionId>,
+
+    /// When the PTY most recently produced output. Drives the pane-activity
+    /// heuristic that distinguishes an actively-working non-rich CLI agent
+    /// (e.g. Codex, recent output) from one idling at its prompt (no output).
+    last_output_at: Option<Instant>,
 }
 
 #[derive(Clone, Debug)]
@@ -1102,7 +1108,22 @@ impl TerminalModel {
             // Start mid-way through the u32 range to avoid collisions
             next_kitty_image_id: 2147483647,
             registered_session_ids: HashSet::new(),
+            last_output_at: None,
         }
+    }
+
+    /// Records that the PTY produced output just now. Used by the pane-activity
+    /// heuristic to distinguish a non-rich CLI agent (e.g. Codex) that is
+    /// actively working (recent output) from one idling at its prompt.
+    pub fn note_output_activity(&mut self) {
+        self.last_output_at = Some(Instant::now());
+    }
+
+    /// Milliseconds since the PTY most recently produced output, if ever.
+    /// Used by the pane-activity heuristic to tell an actively-working non-rich
+    /// CLI agent (recent output) from one idling at its prompt.
+    pub fn millis_since_last_output(&self) -> Option<u128> {
+        self.last_output_at.map(|t| t.elapsed().as_millis())
     }
 
     /// Creates a terminal model for a local terminal session.
@@ -3266,6 +3287,17 @@ impl ansi::Handler for TerminalModel {
         }
 
         let bytes = input.bytes();
+
+        // Stamp real PTY output for the CLI-agent pane-activity heuristic, which
+        // distinguishes an actively-working non-rich agent (e.g. Codex, recent
+        // output) from one idling at its prompt. This must count output from
+        // both normal and synchronized-output (mode 2026) frames: a TUI like
+        // Codex emits its working output inside sync frames (flushed via
+        // finish_sync_output), and skipping those would make an active agent
+        // look idle. Empty toggle-only calls carry no bytes and are skipped.
+        if !bytes.is_empty() {
+            self.note_output_activity();
+        }
 
         // Send a copy of the bytes to subscribers.
         self.event_proxy.send_pty_read_event(bytes);

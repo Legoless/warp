@@ -51,12 +51,16 @@ use crate::pane_group::{BackingView, TerminalPaneId};
 use crate::server::ids::{ClientId, SyncId};
 use crate::server::server_api::ai::SpawnAgentRequest;
 use crate::settings::import::model::ImportedConfigModel;
-use crate::settings::{AISettings, AppEditorSettings, WarpPromptSeparator};
+use crate::settings::{
+    AISettings, AppEditorSettings, EnforceMinimumContrast, FontSettings, PaneActivityState,
+    PaneColorMode, PaneSettings, WarpPromptSeparator,
+};
 use crate::terminal::alt_screen::should_intercept_mouse;
 use crate::terminal::block_list_element::{SnackbarPoint, SnackbarTranslationMode};
 use crate::terminal::block_list_viewport::{ClampingMode, ScrollLines};
 use crate::terminal::cli_agent_sessions::event::{
     CLIAgentEvent, CLIAgentEventPayload, CLIAgentEventSource, CLIAgentEventType,
+    CLI_AGENT_NOTIFICATION_SENTINEL,
 };
 use crate::terminal::cli_agent_sessions::listener::CLIAgentSessionListener;
 use crate::terminal::cli_agent_sessions::{
@@ -488,6 +492,1133 @@ fn updated_conversation_metadata_refreshes_selected_conversation_pane_title() {
         });
     })
 }
+
+#[test]
+fn theme_change_refreshes_activity_pane_color() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        let updated_activity_color = terminal.update(&mut app, |view, ctx| {
+            PaneSettings::handle(ctx).update(ctx, |pane_settings, ctx| {
+                pane_settings
+                    .pane_color_mode
+                    .set_value(PaneColorMode::Activity, ctx)
+                    .expect("pane color mode should update");
+            });
+            CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+                sessions.set_session(
+                    view.view_id,
+                    cli_agent_session_with_query(
+                        CLIAgent::Claude,
+                        CLIAgentSessionStatus::InProgress,
+                        true,
+                        "fix this",
+                    ),
+                    ctx,
+                );
+            });
+            view.update_pane_configuration(ctx);
+
+            let initial_activity_color = activity_color_for_current_theme(ctx);
+            assert_eq!(
+                view.pane_configuration.as_ref(ctx).activity_color(),
+                Some(initial_activity_color)
+            );
+
+            Appearance::handle(ctx).update(ctx, |appearance, ctx| {
+                appearance.set_theme(crate::themes::default_themes::light_theme(), ctx);
+            });
+
+            let updated_activity_color = activity_color_for_current_theme(ctx);
+            assert_ne!(initial_activity_color, updated_activity_color);
+            updated_activity_color
+        });
+
+        assert_eventually!(
+            terminal.read(&app, |view, ctx| {
+                view.pane_configuration.as_ref(ctx).activity_color() == Some(updated_activity_color)
+            }),
+            "pane activity color should refresh after theme change"
+        );
+    })
+}
+
+#[test]
+fn alt_screen_panes_preserve_content_colors_in_activity_mode() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            PaneSettings::handle(ctx).update(ctx, |pane_settings, ctx| {
+                pane_settings
+                    .pane_color_mode
+                    .set_value(PaneColorMode::Activity, ctx)
+                    .expect("pane color mode should update");
+            });
+
+            assert!(!view
+                .pane_configuration
+                .as_ref(ctx)
+                .preserve_content_colors());
+            view.model.lock().enter_alt_screen(true);
+            view.update_pane_configuration(ctx);
+
+            assert!(
+                view.pane_configuration
+                    .as_ref(ctx)
+                    .preserve_content_colors(),
+                "alt-screen TUIs should preserve terminal-authored colors"
+            );
+        });
+    })
+}
+
+#[test]
+fn custom_cli_agent_panes_preserve_content_colors_in_activity_mode() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            PaneSettings::handle(ctx).update(ctx, |pane_settings, ctx| {
+                pane_settings
+                    .pane_color_mode
+                    .set_value(PaneColorMode::Activity, ctx)
+                    .expect("pane color mode should update");
+            });
+            CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+                sessions.set_session(
+                    view.view_id,
+                    cli_agent_session(CLIAgent::Unknown, CLIAgentSessionStatus::InProgress, false),
+                    ctx,
+                );
+            });
+
+            assert!(!view.model.lock().is_alt_screen_active());
+            view.update_pane_configuration(ctx);
+
+            assert!(
+                view.pane_configuration
+                    .as_ref(ctx)
+                    .preserve_content_colors(),
+                "custom CLI agent TUI panes should preserve terminal-authored colors"
+            );
+        });
+    })
+}
+
+#[test]
+fn cli_agent_command_panes_preserve_content_colors_before_session_exists() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            PaneSettings::handle(ctx).update(ctx, |pane_settings, ctx| {
+                pane_settings
+                    .pane_color_mode
+                    .set_value(PaneColorMode::Activity, ctx)
+                    .expect("pane color mode should update");
+            });
+            view.model.lock().simulate_long_running_block(
+                "claude --dangerously-skip-permissions",
+                "Quick safety check",
+            );
+
+            assert!(CLIAgentSessionsModel::as_ref(ctx)
+                .session(view.view_id)
+                .is_none());
+            view.update_pane_configuration(ctx);
+
+            assert!(
+                view.pane_configuration
+                    .as_ref(ctx)
+                    .preserve_content_colors(),
+                "CLI-agent command output should preserve terminal-authored colors even before session detection catches up"
+            );
+        });
+    })
+}
+
+#[test]
+fn alt_screen_terminal_rendering_disables_minimum_contrast_when_content_colors_are_preserved() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            PaneSettings::handle(ctx).update(ctx, |pane_settings, ctx| {
+                pane_settings
+                    .pane_color_mode
+                    .set_value(PaneColorMode::Activity, ctx)
+                    .expect("pane color mode should update");
+            });
+            FontSettings::handle(ctx).update(ctx, |font_settings, ctx| {
+                font_settings
+                    .enforce_minimum_contrast
+                    .set_value(EnforceMinimumContrast::Always, ctx)
+                    .expect("minimum contrast setting should update");
+            });
+
+            view.model.lock().enter_alt_screen(true);
+            view.update_pane_configuration(ctx);
+
+            assert!(view
+                .pane_configuration
+                .as_ref(ctx)
+                .preserve_content_colors());
+            let model = view.model.lock();
+            assert_eq!(
+                view.terminal_grid_enforce_minimum_contrast(&model, ctx),
+                EnforceMinimumContrast::Never,
+                "alt-screen render entry should not rewrite TUI-authored terminal colors"
+            );
+        });
+    })
+}
+
+#[test]
+fn alt_screen_terminal_rendering_disables_minimum_contrast_outside_activity_mode() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            FontSettings::handle(ctx).update(ctx, |font_settings, ctx| {
+                font_settings
+                    .enforce_minimum_contrast
+                    .set_value(EnforceMinimumContrast::Always, ctx)
+                    .expect("minimum contrast setting should update");
+            });
+
+            view.model.lock().enter_alt_screen(true);
+            view.update_pane_configuration(ctx);
+
+            assert!(!view
+                .pane_configuration
+                .as_ref(ctx)
+                .preserve_content_colors());
+            let model = view.model.lock();
+            assert_eq!(
+                view.terminal_grid_enforce_minimum_contrast(&model, ctx),
+                EnforceMinimumContrast::Never,
+                "alt-screen render entry should preserve TUI colors independently of Activity pane mode"
+            );
+        });
+    })
+}
+
+#[test]
+fn cli_agent_terminal_rendering_disables_minimum_contrast_when_content_colors_are_preserved() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            PaneSettings::handle(ctx).update(ctx, |pane_settings, ctx| {
+                pane_settings
+                    .pane_color_mode
+                    .set_value(PaneColorMode::Activity, ctx)
+                    .expect("pane color mode should update");
+            });
+            FontSettings::handle(ctx).update(ctx, |font_settings, ctx| {
+                font_settings
+                    .enforce_minimum_contrast
+                    .set_value(EnforceMinimumContrast::OnlyNamedColors, ctx)
+                    .expect("minimum contrast setting should update");
+            });
+            CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+                sessions.set_session(
+                    view.view_id,
+                    cli_agent_session(CLIAgent::OpenCode, CLIAgentSessionStatus::InProgress, true),
+                    ctx,
+                );
+            });
+
+            assert!(!view.model.lock().is_alt_screen_active());
+            view.update_pane_configuration(ctx);
+
+            assert!(view
+                .pane_configuration
+                .as_ref(ctx)
+                .preserve_content_colors());
+            let model = view.model.lock();
+            assert_eq!(
+                view.terminal_grid_enforce_minimum_contrast(&model, ctx),
+                EnforceMinimumContrast::Never,
+                "CLI agent render entry should not rewrite TUI-authored terminal colors"
+            );
+        });
+    })
+}
+
+#[test]
+fn first_party_cli_agent_tuis_preserve_terminal_drawn_colors_in_activity_mode() {
+    fn run_for_agent(agent: CLIAgent) {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let terminal = add_window_with_terminal(&mut app, None);
+            let foreground = ColorU::new(255, 40, 30, 255);
+            let background = ColorU::new(20, 220, 70, 255);
+
+            terminal.update(&mut app, |view, ctx| {
+                PaneSettings::handle(ctx).update(ctx, |pane_settings, ctx| {
+                    pane_settings
+                        .pane_color_mode
+                        .set_value(PaneColorMode::Activity, ctx)
+                        .expect("pane color mode should update");
+                });
+                FontSettings::handle(ctx).update(ctx, |font_settings, ctx| {
+                    font_settings
+                        .enforce_minimum_contrast
+                        .set_value(EnforceMinimumContrast::Always, ctx)
+                        .expect("minimum contrast setting should update");
+                });
+                CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+                    sessions.set_session(
+                        view.view_id,
+                        cli_agent_session(agent, CLIAgentSessionStatus::InProgress, false),
+                        ctx,
+                    );
+                });
+                let ansi_tui_output = format!(
+                    "\x1b[38;2;{};{};{}mF\x1b[0m\x1b[48;2;{};{};{}mB\x1b[0m",
+                    foreground.r,
+                    foreground.g,
+                    foreground.b,
+                    background.r,
+                    background.g,
+                    background.b
+                );
+                view.model
+                    .lock()
+                    .simulate_long_running_block(agent.command_prefix(), ansi_tui_output.as_str());
+
+                assert!(!view.model.lock().is_alt_screen_active());
+                view.update_pane_configuration(ctx);
+
+                assert!(
+                    view.pane_configuration
+                        .as_ref(ctx)
+                        .preserve_content_colors(),
+                    "{agent:?} TUI panes should not receive Activity pane tint over terminal colors"
+                );
+                let model = view.model.lock();
+                assert_eq!(
+                    view.terminal_grid_enforce_minimum_contrast(&model, ctx),
+                    EnforceMinimumContrast::Never,
+                    "{agent:?} TUI rendering should not rewrite terminal-authored colors"
+                );
+
+                let output_grid = model.block_list().active_block().output_grid();
+                let cells = output_grid.grid_storage();
+                let foreground_cell = &cells[0][0];
+                let background_cell = &cells[0][1];
+                assert_eq!(
+                    foreground_cell.fg,
+                    ansi::Color::Spec(foreground),
+                    "{agent:?} TUI foreground ANSI color should survive into the terminal grid"
+                );
+                assert_eq!(
+                    background_cell.bg,
+                    ansi::Color::Spec(background),
+                    "{agent:?} TUI background ANSI color should survive into the terminal grid"
+                );
+            });
+        })
+    }
+
+    run_for_agent(CLIAgent::Claude);
+    run_for_agent(CLIAgent::Codex);
+    run_for_agent(CLIAgent::OpenCode);
+}
+
+#[test]
+fn completed_first_party_cli_agent_tuis_preserve_content_colors_in_activity_mode() {
+    fn run_for_agent(agent: CLIAgent) {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let terminal = add_window_with_terminal(&mut app, None);
+
+            terminal.update(&mut app, |view, ctx| {
+                PaneSettings::handle(ctx).update(ctx, |pane_settings, ctx| {
+                    pane_settings
+                        .pane_color_mode
+                        .set_value(PaneColorMode::Activity, ctx)
+                        .expect("pane color mode should update");
+                });
+                view.model.lock().simulate_block(
+                    agent.command_prefix(),
+                    "\x1b[38;2;255;40;30mTUI_FG\x1b[0m default background",
+                );
+
+                assert!(!view.model.lock().is_alt_screen_active());
+                assert!(CLIAgentSessionsModel::as_ref(ctx)
+                    .session(view.view_id)
+                    .is_none());
+                view.update_pane_configuration(ctx);
+
+                assert!(
+                    view.pane_configuration
+                        .as_ref(ctx)
+                        .preserve_content_colors(),
+                    "{agent:?} completed TUI output should preserve terminal-authored colors"
+                );
+            });
+        })
+    }
+
+    run_for_agent(CLIAgent::Claude);
+    run_for_agent(CLIAgent::Codex);
+    run_for_agent(CLIAgent::OpenCode);
+}
+
+#[test]
+fn cli_agent_command_terminal_rendering_disables_minimum_contrast_before_session_exists() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            FontSettings::handle(ctx).update(ctx, |font_settings, ctx| {
+                font_settings
+                    .enforce_minimum_contrast
+                    .set_value(EnforceMinimumContrast::OnlyNamedColors, ctx)
+                    .expect("minimum contrast setting should update");
+            });
+            view.model.lock().simulate_long_running_block(
+                "claude --dangerously-skip-permissions",
+                "Quick safety check",
+            );
+
+            assert!(CLIAgentSessionsModel::as_ref(ctx)
+                .session(view.view_id)
+                .is_none());
+            view.update_pane_configuration(ctx);
+
+            assert!(!view
+                .pane_configuration
+                .as_ref(ctx)
+                .preserve_content_colors());
+            let model = view.model.lock();
+            assert_eq!(
+                view.terminal_grid_enforce_minimum_contrast(&model, ctx),
+                EnforceMinimumContrast::Never,
+                "CLI-agent command rendering should preserve TUI colors before session detection catches up"
+            );
+        });
+    })
+}
+
+#[test]
+fn custom_cli_agent_terminal_rendering_disables_minimum_contrast_outside_activity_mode() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            FontSettings::handle(ctx).update(ctx, |font_settings, ctx| {
+                font_settings
+                    .enforce_minimum_contrast
+                    .set_value(EnforceMinimumContrast::OnlyNamedColors, ctx)
+                    .expect("minimum contrast setting should update");
+            });
+            CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+                sessions.set_session(
+                    view.view_id,
+                    cli_agent_session(CLIAgent::Unknown, CLIAgentSessionStatus::InProgress, false),
+                    ctx,
+                );
+            });
+
+            assert!(!view.model.lock().is_alt_screen_active());
+            view.update_pane_configuration(ctx);
+
+            assert!(!view
+                .pane_configuration
+                .as_ref(ctx)
+                .preserve_content_colors());
+            let model = view.model.lock();
+            assert_eq!(
+                view.terminal_grid_enforce_minimum_contrast(&model, ctx),
+                EnforceMinimumContrast::Never,
+                "custom CLI agent render entry should preserve TUI colors independently of Activity pane mode"
+            );
+        });
+    })
+}
+
+#[test]
+fn block_list_terminal_rendering_keeps_configured_minimum_contrast() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            PaneSettings::handle(ctx).update(ctx, |pane_settings, ctx| {
+                pane_settings
+                    .pane_color_mode
+                    .set_value(PaneColorMode::Activity, ctx)
+                    .expect("pane color mode should update");
+            });
+            FontSettings::handle(ctx).update(ctx, |font_settings, ctx| {
+                font_settings
+                    .enforce_minimum_contrast
+                    .set_value(EnforceMinimumContrast::Always, ctx)
+                    .expect("minimum contrast setting should update");
+            });
+
+            view.update_pane_configuration(ctx);
+
+            assert!(!view
+                .pane_configuration
+                .as_ref(ctx)
+                .preserve_content_colors());
+            let model = view.model.lock();
+            assert_eq!(
+                view.terminal_grid_enforce_minimum_contrast(&model, ctx),
+                EnforceMinimumContrast::Always,
+                "normal block-list render entry should preserve the user contrast setting"
+            );
+        });
+    })
+}
+
+#[test]
+fn claude_cli_agent_changes_activity_color_without_losing_tui_colors() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            PaneSettings::handle(ctx).update(ctx, |pane_settings, ctx| {
+                pane_settings
+                    .pane_color_mode
+                    .set_value(PaneColorMode::Activity, ctx)
+                    .expect("pane color mode should update");
+            });
+            CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+                sessions.set_session(
+                    view.view_id,
+                    cli_agent_session_with_query(
+                        CLIAgent::Claude,
+                        CLIAgentSessionStatus::InProgress,
+                        true,
+                        "fix this",
+                    ),
+                    ctx,
+                );
+            });
+
+            assert!(!view.model.lock().is_alt_screen_active());
+            view.update_pane_configuration(ctx);
+
+            let pane_configuration = view.pane_configuration.as_ref(ctx);
+            assert_eq!(
+                pane_configuration.activity_color(),
+                Some(activity_color_for_state(ctx, PaneActivityState::Working)),
+                "rich Claude InProgress status should use the Working activity color"
+            );
+            assert!(
+                pane_configuration.preserve_content_colors(),
+                "Claude Code TUI panes should preserve terminal-drawn colors while working"
+            );
+
+            CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+                sessions.set_session(
+                    view.view_id,
+                    cli_agent_session(CLIAgent::Claude, CLIAgentSessionStatus::Success, true),
+                    ctx,
+                );
+            });
+
+            view.update_pane_configuration(ctx);
+            assert_eq!(
+                view.pane_configuration.as_ref(ctx).activity_color(),
+                Some(activity_color_for_state(ctx, PaneActivityState::NotWorking)),
+                "rich Claude Success status should return Activity chrome to idle"
+            );
+            assert!(
+                view.pane_configuration
+                    .as_ref(ctx)
+                    .preserve_content_colors(),
+                "Claude Code TUI panes should preserve terminal-drawn colors after returning idle"
+            );
+        });
+    })
+}
+
+#[test]
+fn codex_cli_agent_preserves_content_colors_but_waits_for_tab_activity_without_rich_status() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            PaneSettings::handle(ctx).update(ctx, |pane_settings, ctx| {
+                pane_settings
+                    .pane_color_mode
+                    .set_value(PaneColorMode::Activity, ctx)
+                    .expect("pane color mode should update");
+            });
+            CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+                sessions.set_session(
+                    view.view_id,
+                    cli_agent_session(CLIAgent::Codex, CLIAgentSessionStatus::InProgress, false),
+                    ctx,
+                );
+            });
+
+            assert!(!view.model.lock().is_alt_screen_active());
+            view.update_pane_configuration(ctx);
+
+            assert_eq!(
+                view.pane_configuration.as_ref(ctx).activity_color(),
+                Some(activity_color_for_state(ctx, PaneActivityState::NotWorking)),
+                "command-detected Codex should not start red before tab/conversation activity exists"
+            );
+            assert!(
+                view.pane_configuration
+                    .as_ref(ctx)
+                    .preserve_content_colors(),
+                "Codex TUI panes should preserve terminal-drawn colors even while Activity is idle"
+            );
+        });
+    })
+}
+
+#[test]
+fn codex_completion_notification_returns_activity_color_to_idle_while_process_keeps_running() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            PaneSettings::handle(ctx).update(ctx, |pane_settings, ctx| {
+                pane_settings
+                    .pane_color_mode
+                    .set_value(PaneColorMode::Activity, ctx)
+                    .expect("pane color mode should update");
+            });
+            view.model.lock().simulate_long_running_block(
+                CLIAgent::Codex.command_prefix(),
+                "\x1b[38;2;255;40;30mTUI_RED_FG\x1b[0m",
+            );
+            CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+                sessions.set_session(
+                    view.view_id,
+                    cli_agent_session(CLIAgent::Codex, CLIAgentSessionStatus::Success, false),
+                    ctx,
+                );
+            });
+
+            assert!(!view.model.lock().is_alt_screen_active());
+            view.update_pane_configuration(ctx);
+
+            let pane_configuration = view.pane_configuration.as_ref(ctx);
+            assert_eq!(
+                pane_configuration.activity_color(),
+                Some(activity_color_for_state(ctx, PaneActivityState::NotWorking)),
+                "Codex completion should return Activity chrome to idle even while the Codex process remains open"
+            );
+            assert!(
+                pane_configuration.preserve_content_colors(),
+                "completed Codex TUI panes should still preserve terminal-drawn colors"
+            );
+        });
+    })
+}
+
+#[test]
+fn codex_legacy_prompt_submit_reactivates_activity_color_when_output_is_active() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            PaneSettings::handle(ctx).update(ctx, |pane_settings, ctx| {
+                pane_settings
+                    .pane_color_mode
+                    .set_value(PaneColorMode::Activity, ctx)
+                    .expect("pane color mode should update");
+            });
+            view.model.lock().simulate_long_running_block(
+                CLIAgent::Codex.command_prefix(),
+                "\x1b[38;2;255;40;30mTUI_RED_FG\x1b[0m",
+            );
+            CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+                sessions.set_session(
+                    view.view_id,
+                    cli_agent_session(CLIAgent::Codex, CLIAgentSessionStatus::Success, false),
+                    ctx,
+                );
+            });
+
+            view.update_pane_configuration(ctx);
+            assert_eq!(
+                view.pane_configuration.as_ref(ctx).activity_color(),
+                Some(activity_color_for_state(ctx, PaneActivityState::NotWorking)),
+                "legacy Codex should be idle after a completion notification"
+            );
+
+            view.write_user_bytes_to_pty(b"continue\r".to_vec(), ctx);
+            view.update_pane_configuration(ctx);
+
+            let session = CLIAgentSessionsModel::as_ref(ctx)
+                .session(view.view_id)
+                .expect("Codex session should still exist");
+            assert_eq!(session.status, CLIAgentSessionStatus::InProgress);
+            assert_eq!(
+                view.pane_title_activity_status_for_chrome(ctx),
+                Some(ConversationStatus::InProgress)
+            );
+            assert_eq!(
+                view.pane_configuration.as_ref(ctx).activity_color(),
+                Some(activity_color_for_state(ctx, PaneActivityState::Working)),
+                "submitting a new prompt to the running Codex TUI should reactivate Activity chrome when output is active"
+            );
+            assert!(
+                view.pane_configuration
+                    .as_ref(ctx)
+                    .preserve_content_colors(),
+                "Codex TUI panes should preserve terminal-drawn colors while Activity chrome is Working"
+            );
+
+            CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+                sessions.update_from_event(
+                    view.view_id,
+                    &CLIAgentEvent {
+                        v: 1,
+                        agent: CLIAgent::Codex,
+                        event: CLIAgentEventType::Stop,
+                        session_id: None,
+                        cwd: None,
+                        project: None,
+                        payload: CLIAgentEventPayload {
+                            query: Some("Agent turn complete".to_owned()),
+                            ..Default::default()
+                        },
+                        source: CLIAgentEventSource::CodexOsc9Fallback,
+                    },
+                    ctx,
+                );
+            });
+            view.update_pane_configuration(ctx);
+
+            assert_eq!(
+                view.pane_configuration.as_ref(ctx).activity_color(),
+                Some(activity_color_for_state(ctx, PaneActivityState::NotWorking)),
+                "the next legacy Codex completion should return Activity chrome to idle"
+            );
+        });
+    })
+}
+
+#[test]
+fn non_codex_first_party_cli_agent_commands_drive_activity_color_without_rich_status() {
+    fn run_for_agent(agent: CLIAgent) {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let terminal = add_window_with_terminal(&mut app, None);
+
+            terminal.update(&mut app, |view, ctx| {
+                PaneSettings::handle(ctx).update(ctx, |pane_settings, ctx| {
+                    pane_settings
+                        .pane_color_mode
+                        .set_value(PaneColorMode::Activity, ctx)
+                        .expect("pane color mode should update");
+                });
+                view.model.lock().simulate_long_running_block(
+                    agent.command_prefix(),
+                    "\x1b[38;2;255;40;30mTUI_RED_FG\x1b[0m",
+                );
+
+                assert!(CLIAgentSessionsModel::as_ref(ctx)
+                    .session(view.view_id)
+                    .is_none());
+                assert!(!view.model.lock().is_alt_screen_active());
+                view.update_pane_configuration(ctx);
+
+                let pane_configuration = view.pane_configuration.as_ref(ctx);
+                assert_eq!(
+                    pane_configuration.activity_color(),
+                    Some(activity_color_for_state(ctx, PaneActivityState::Working)),
+                    "a running command-detected {agent:?} TUI should use Working Activity chrome before rich status arrives"
+                );
+                assert!(
+                    pane_configuration.preserve_content_colors(),
+                    "running {agent:?} TUI panes should keep terminal-drawn colors while Activity chrome is Working"
+                );
+            });
+        })
+    }
+
+    for agent in [CLIAgent::Claude, CLIAgent::OpenCode] {
+        run_for_agent(agent);
+    }
+}
+
+#[test]
+fn command_detected_codex_activity_color_follows_pane_title_indicator() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            PaneSettings::handle(ctx).update(ctx, |pane_settings, ctx| {
+                pane_settings
+                    .pane_color_mode
+                    .set_value(PaneColorMode::Activity, ctx)
+                    .expect("pane color mode should update");
+            });
+            view.model.lock().simulate_long_running_block(
+                CLIAgent::Codex.command_prefix(),
+                "\x1b[38;2;255;40;30mTUI_RED_FG\x1b[0m",
+            );
+            CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+                sessions.set_session(
+                    view.view_id,
+                    cli_agent_session(CLIAgent::Codex, CLIAgentSessionStatus::InProgress, false),
+                    ctx,
+                );
+            });
+
+            assert!(!view.model.lock().is_alt_screen_active());
+            view.update_pane_configuration(ctx);
+
+            let pane_configuration = view.pane_configuration.as_ref(ctx);
+            assert_eq!(
+                view.pane_title_activity_status_for_chrome(ctx),
+                Some(ConversationStatus::InProgress)
+            );
+            assert_eq!(
+                pane_configuration.activity_color(),
+                Some(activity_color_for_state(ctx, PaneActivityState::Working)),
+                "a command-detected Codex TUI should use Working Activity chrome when the pane-title activity indicator is active"
+            );
+            assert!(
+                pane_configuration.preserve_content_colors(),
+                "running Codex TUI panes should preserve terminal-drawn colors while Activity chrome is Working"
+            );
+
+            CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+                sessions.set_session(
+                    view.view_id,
+                    cli_agent_session(CLIAgent::Codex, CLIAgentSessionStatus::Success, false),
+                    ctx,
+                );
+            });
+            view.update_pane_configuration(ctx);
+
+            assert_eq!(view.pane_title_activity_status_for_chrome(ctx), None);
+            assert_eq!(
+                view.pane_configuration.as_ref(ctx).activity_color(),
+                Some(activity_color_for_state(ctx, PaneActivityState::NotWorking)),
+                "completed Codex should clear Activity chrome immediately even if output was recent"
+            );
+        });
+    })
+}
+
+#[test]
+fn codex_activity_color_follows_conversation_status_without_losing_tui_colors() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            PaneSettings::handle(ctx).update(ctx, |pane_settings, ctx| {
+                pane_settings
+                    .pane_color_mode
+                    .set_value(PaneColorMode::Activity, ctx)
+                    .expect("pane color mode should update");
+            });
+            let (conversation_id, _task_id, _exchange_id, _stream_id) =
+                append_exchange_and_handle_event(view, agent_jump_user_query("fix this"), ctx);
+            view.enter_agent_view(
+                None,
+                Some(conversation_id),
+                AgentViewEntryOrigin::ConversationSelector,
+                ctx,
+            );
+            CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+                sessions.set_session(
+                    view.view_id,
+                    cli_agent_session(CLIAgent::Codex, CLIAgentSessionStatus::Success, false),
+                    ctx,
+                );
+            });
+            BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, _ctx| {
+                history
+                    .conversation_mut(&conversation_id)
+                    .expect("conversation should exist")
+                    .set_status_for_test(ConversationStatus::InProgress);
+            });
+
+            assert!(!view.model.lock().is_alt_screen_active());
+            view.update_pane_configuration(ctx);
+            let pane_configuration = view.pane_configuration.as_ref(ctx);
+            assert_eq!(
+                pane_configuration.activity_color(),
+                Some(activity_color_for_state(ctx, PaneActivityState::Working)),
+                "selected Codex conversation activity should override stale non-rich CLI Success"
+            );
+            assert!(
+                pane_configuration.preserve_content_colors(),
+                "Codex TUI panes should preserve terminal-drawn colors while the agent is working"
+            );
+
+            BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, _ctx| {
+                history
+                    .conversation_mut(&conversation_id)
+                    .expect("conversation should exist")
+                    .set_status_for_test(ConversationStatus::Success);
+            });
+            view.update_pane_configuration(ctx);
+
+            assert_eq!(
+                view.pane_configuration.as_ref(ctx).activity_color(),
+                Some(activity_color_for_state(ctx, PaneActivityState::NotWorking)),
+                "finished Codex conversation should return Activity chrome to idle"
+            );
+            assert!(
+                view.pane_configuration
+                    .as_ref(ctx)
+                    .preserve_content_colors(),
+                "Codex TUI panes should preserve terminal-drawn colors after the agent is idle"
+            );
+        });
+    })
+}
+
+#[test]
+fn codex_structured_session_start_waits_for_pane_title_indicator_before_activity_color() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _codex_plugin = FeatureFlag::CodexPlugin.override_enabled(false);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            PaneSettings::handle(ctx).update(ctx, |pane_settings, ctx| {
+                pane_settings
+                    .pane_color_mode
+                    .set_value(PaneColorMode::Activity, ctx)
+                    .expect("pane color mode should update");
+            });
+
+            view.handle_cli_agent_notification(
+                Some(CLI_AGENT_NOTIFICATION_SENTINEL),
+                r#"{"v":1,"agent":"codex","event":"session_start","session_id":"abc","cwd":"/tmp","project":"tmp","plugin_version":"1.1.0"}"#,
+                ctx,
+            );
+
+            let session = CLIAgentSessionsModel::as_ref(ctx)
+                .session(view.view_id)
+                .expect("Codex session should be registered from structured notification");
+            assert_eq!(session.agent, CLIAgent::Codex);
+            assert!(
+                session.supports_rich_status(),
+                "Codex structured notifications should count as rich status even when plugin install is feature-gated"
+            );
+
+            assert!(!view.model.lock().is_alt_screen_active());
+            view.update_pane_configuration(ctx);
+            let pane_configuration = view.pane_configuration.as_ref(ctx);
+            assert_eq!(view.pane_title_activity_status_for_chrome(ctx), None);
+            assert_eq!(
+                pane_configuration.activity_color(),
+                Some(activity_color_for_state(ctx, PaneActivityState::NotWorking)),
+                "rich Codex session_start should not paint Activity chrome before the pane-title activity indicator exists"
+            );
+            assert!(
+                pane_configuration.preserve_content_colors(),
+                "Codex TUI panes should keep terminal-drawn colors even while Activity chrome is idle"
+            );
+        });
+    })
+}
+
+#[test]
+fn codex_structured_stop_notification_returns_activity_color_to_idle() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _codex_plugin = FeatureFlag::CodexPlugin.override_enabled(false);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            PaneSettings::handle(ctx).update(ctx, |pane_settings, ctx| {
+                pane_settings
+                    .pane_color_mode
+                    .set_value(PaneColorMode::Activity, ctx)
+                    .expect("pane color mode should update");
+            });
+
+            view.handle_cli_agent_notification(
+                Some(CLI_AGENT_NOTIFICATION_SENTINEL),
+                r#"{"v":1,"agent":"codex","event":"session_start","session_id":"abc","cwd":"/tmp","project":"tmp","plugin_version":"1.1.0"}"#,
+                ctx,
+            );
+            view.handle_cli_agent_notification(
+                Some(CLI_AGENT_NOTIFICATION_SENTINEL),
+                r#"{"v":1,"agent":"codex","event":"stop","session_id":"abc","response":"done"}"#,
+                ctx,
+            );
+
+            let session = CLIAgentSessionsModel::as_ref(ctx)
+                .session(view.view_id)
+                .expect("Codex session should still exist");
+            assert_eq!(session.status, CLIAgentSessionStatus::Success);
+
+            view.update_pane_configuration(ctx);
+            assert_eq!(
+                view.pane_configuration.as_ref(ctx).activity_color(),
+                Some(activity_color_for_state(ctx, PaneActivityState::NotWorking)),
+                "rich Codex stop should return Activity chrome to idle"
+            );
+        });
+    })
+}
+
+#[test]
+fn opencode_cli_agent_preserves_content_colors_but_waits_for_rich_status_before_working_color() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            PaneSettings::handle(ctx).update(ctx, |pane_settings, ctx| {
+                pane_settings
+                    .pane_color_mode
+                    .set_value(PaneColorMode::Activity, ctx)
+                    .expect("pane color mode should update");
+            });
+            CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+                sessions.set_session(
+                    view.view_id,
+                    cli_agent_session(CLIAgent::OpenCode, CLIAgentSessionStatus::InProgress, false),
+                    ctx,
+                );
+            });
+
+            assert!(!view.model.lock().is_alt_screen_active());
+            view.update_pane_configuration(ctx);
+
+            let pane_configuration = view.pane_configuration.as_ref(ctx);
+            assert_eq!(
+                pane_configuration.activity_color(),
+                Some(activity_color_for_state(ctx, PaneActivityState::NotWorking)),
+                "command-detected OpenCode should not stay pinned to Working before rich status arrives"
+            );
+            assert!(
+                pane_configuration.preserve_content_colors(),
+                "OpenCode TUI panes should preserve terminal-drawn colors even outside alt-screen"
+            );
+        });
+    })
+}
+
+#[test]
+fn opencode_rich_status_changes_activity_color_between_working_and_not_working() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            PaneSettings::handle(ctx).update(ctx, |pane_settings, ctx| {
+                pane_settings
+                    .pane_color_mode
+                    .set_value(PaneColorMode::Activity, ctx)
+                    .expect("pane color mode should update");
+            });
+            CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+                sessions.set_session(
+                    view.view_id,
+                    cli_agent_session(CLIAgent::OpenCode, CLIAgentSessionStatus::InProgress, true),
+                    ctx,
+                );
+            });
+
+            view.update_pane_configuration(ctx);
+            let pane_configuration = view.pane_configuration.as_ref(ctx);
+            assert_eq!(
+                pane_configuration.activity_color(),
+                Some(activity_color_for_state(ctx, PaneActivityState::Working)),
+                "rich OpenCode InProgress status should use the Working color"
+            );
+            assert!(
+                pane_configuration.preserve_content_colors(),
+                "OpenCode TUI panes should preserve terminal-drawn colors once rich status is active"
+            );
+
+            CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+                sessions.set_session(
+                    view.view_id,
+                    cli_agent_session(CLIAgent::OpenCode, CLIAgentSessionStatus::Success, true),
+                    ctx,
+                );
+            });
+
+            view.update_pane_configuration(ctx);
+            assert_eq!(
+                view.pane_configuration.as_ref(ctx).activity_color(),
+                Some(activity_color_for_state(ctx, PaneActivityState::NotWorking)),
+                "rich OpenCode Success status should return to the NotWorking color"
+            );
+            assert!(
+                view.pane_configuration
+                    .as_ref(ctx)
+                    .preserve_content_colors(),
+                "OpenCode TUI panes should preserve terminal-drawn colors after returning idle"
+            );
+        });
+    })
+}
+
+fn activity_color_for_current_theme(ctx: &AppContext) -> ColorU {
+    activity_color_for_state(ctx, PaneActivityState::Working)
+}
+
+fn activity_color_for_state(ctx: &AppContext, state: PaneActivityState) -> ColorU {
+    state
+        .default_color()
+        .to_ansi_color(&Appearance::as_ref(ctx).theme().terminal_colors().normal)
+        .into()
+}
+
+fn cli_agent_session(
+    agent: CLIAgent,
+    status: CLIAgentSessionStatus,
+    received_rich_notification: bool,
+) -> CLIAgentSession {
+    CLIAgentSession {
+        agent,
+        status,
+        session_context: CLIAgentSessionContext::default(),
+        input_state: CLIAgentInputState::Closed,
+        should_auto_toggle_input: false,
+        listener: None,
+        remote_host: None,
+        plugin_version: None,
+        draft_text: None,
+        custom_command_prefix: None,
+        received_rich_notification,
+    }
+}
+
+fn cli_agent_session_with_query(
+    agent: CLIAgent,
+    status: CLIAgentSessionStatus,
+    received_rich_notification: bool,
+    query: &str,
+) -> CLIAgentSession {
+    let mut session = cli_agent_session(agent, status, received_rich_notification);
+    session.session_context.query = Some(query.to_owned());
+    session
+}
+
 struct TestTerminalManager {
     model: Arc<FairMutex<TerminalModel>>,
     _view: ViewHandle<TerminalView>,

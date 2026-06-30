@@ -108,6 +108,15 @@ fn test_state_dir_path() {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn test_oss_secure_state_dir_skips_official_app_group_container() {
+    // ChannelState, by default, is configured for Channel::Oss. OSS builds are
+    // not guaranteed to have Warp's official app-group entitlement, so startup
+    // must fall back to the normal per-app state dir instead.
+    assert_eq!(secure_state_dir(), None);
+}
+
 #[test]
 fn test_tui_state_dir_is_tui_subdir_of_gui_state_base() {
     let tui_dir = tui_state_dir();
