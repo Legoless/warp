@@ -53,10 +53,12 @@ impl AgentNotificationsModel {
             me.handle_active_agent_views_changed(event, ctx);
         });
 
-        Self {
+        let model = Self {
             notifications: NotificationItems::default(),
             pending_artifacts: HashMap::new(),
-        }
+        };
+        model.update_dock_badge(ctx);
+        model
     }
 
     pub(crate) fn notifications(&self) -> &NotificationItems {
@@ -65,12 +67,14 @@ impl AgentNotificationsModel {
 
     pub(crate) fn mark_item_read(&mut self, id: NotificationId, ctx: &mut ModelContext<Self>) {
         if self.notifications.mark_item_read(id) {
+            self.update_dock_badge(ctx);
             ctx.emit(AgentManagementEvent::NotificationUpdated);
         }
     }
 
     pub(crate) fn mark_all_items_read(&mut self, ctx: &mut ModelContext<Self>) {
         if self.notifications.mark_all_items_read() {
+            self.update_dock_badge(ctx);
             ctx.emit(AgentManagementEvent::AllNotificationsMarkedRead);
         }
     }
@@ -88,6 +92,7 @@ impl AgentNotificationsModel {
             .notifications
             .mark_all_terminal_view_items_as_read(terminal_view_id)
         {
+            self.update_dock_badge(ctx);
             ctx.emit(AgentManagementEvent::NotificationUpdated);
         }
     }
@@ -105,12 +110,10 @@ impl AgentNotificationsModel {
             ActiveAgentViewsEvent::ConversationClosed { conversation_id } => {
                 // When a conversation is closed, clean up its notifications
                 // (as there's no conversation to navigate to when you click said notifications).
-                if self
-                    .notifications
-                    .remove_by_origin(NotificationOrigin::Conversation(*conversation_id))
-                {
-                    ctx.emit(AgentManagementEvent::NotificationUpdated);
-                }
+                self.remove_notification_by_source(
+                    NotificationOrigin::Conversation(*conversation_id),
+                    ctx,
+                );
             }
             ActiveAgentViewsEvent::TerminalViewFocused
             | ActiveAgentViewsEvent::WindowClosed
@@ -436,8 +439,13 @@ impl AgentNotificationsModel {
         ctx: &mut ModelContext<Self>,
     ) {
         if self.notifications.remove_by_origin(origin) {
+            self.update_dock_badge(ctx);
             ctx.emit(AgentManagementEvent::NotificationUpdated);
         }
+    }
+
+    fn update_dock_badge(&self, ctx: &AppContext) {
+        ctx.set_dock_badge_count(self.notifications.dock_badge_count());
     }
 
     /// Drains and returns the pending artifacts for a conversation.
@@ -478,6 +486,7 @@ impl AgentNotificationsModel {
 
         let id = item.id;
         self.notifications.push(item);
+        self.update_dock_badge(ctx);
         ctx.emit(AgentManagementEvent::NotificationAdded { id });
     }
 }

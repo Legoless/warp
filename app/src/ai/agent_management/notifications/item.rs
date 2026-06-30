@@ -165,6 +165,31 @@ impl NotificationItems {
         self.items_filtered(filter).count()
     }
 
+    /// Count unread local agent outcomes that should be reflected in the Dock badge.
+    pub(crate) fn dock_badge_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| {
+                !item.is_read
+                    && matches!(
+                        item.category,
+                        NotificationCategory::Complete | NotificationCategory::Request
+                    )
+                    && matches!(
+                        item.agent,
+                        NotificationSourceAgent::Oz { is_ambient: false }
+                            | NotificationSourceAgent::CLI {
+                                agent: CLIAgent::Claude
+                                    | CLIAgent::Codex
+                                    | CLIAgent::Auggie
+                                    | CLIAgent::OpenCode,
+                                is_ambient: false,
+                            }
+                    )
+            })
+            .count()
+    }
+
     /// Returns the filters that should be shown as tabs.
     /// "All" is always included; other filters are included only when they have at least one item.
     pub(crate) fn visible_filters(&self) -> Vec<NotificationFilter> {
