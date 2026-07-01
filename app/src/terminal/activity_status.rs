@@ -10,17 +10,31 @@ use crate::terminal::CLIAgent;
 /// black.
 pub(crate) const CLI_AGENT_OUTPUT_QUIET_MS: u128 = 800;
 
+/// Client-owned idle backstop for a *rich* CLI agent (e.g. Claude Code) whose
+/// tracked status is still `InProgress`. A rich session leaves `InProgress` only
+/// on a `stop`/`idle_prompt` event, but those notifications are best-effort — if
+/// they are lost the status latch would pin the pane at "working" forever with
+/// no recovery. This is the fallback that needs no plugin event: Claude's TUI
+/// animates (spinner, elapsed timer, streamed tokens) at least every second
+/// while a turn is active, so once the PTY has been quiet this long the agent
+/// has returned to an idle prompt and the pane goes idle. It is far longer than
+/// `CLI_AGENT_OUTPUT_QUIET_MS` (the non-rich window) so a genuinely-working
+/// agent is never flipped idle during a brief render gap.
+pub(crate) const CLI_AGENT_RICH_IDLE_QUIET_MS: u128 = 5_000;
+
 pub(crate) struct TerminalActivityStatusInputs<'a> {
     pub(crate) cli_session: Option<&'a CLIAgentSession>,
     pub(crate) has_terminal_conversation: bool,
     pub(crate) is_ambient: bool,
     pub(crate) selected_conversation_status: Option<ConversationStatus>,
     pub(crate) has_active_cli_agent_command: bool,
-    /// Whether the pane's PTY produced output recently (within
-    /// `CLI_AGENT_OUTPUT_QUIET_MS`). For a non-rich CLI agent (e.g. Codex) this
-    /// is the signal that it is actively working rather than idling at its
-    /// prompt — Codex has no reliable "started/stopped working" status event.
-    pub(crate) cli_agent_output_active: bool,
+    /// Milliseconds since the pane's PTY last produced output, or `None` if it
+    /// has produced none. Drives two idle checks: `CLI_AGENT_OUTPUT_QUIET_MS`
+    /// for a non-rich CLI agent (e.g. Codex, which has no reliable
+    /// "started/stopped working" event), and `CLI_AGENT_RICH_IDLE_QUIET_MS` as
+    /// the backstop that releases a rich agent's stuck `InProgress` latch when
+    /// its `stop`/`idle_prompt` event was lost.
+    pub(crate) millis_since_last_output: Option<u128>,
     pub(crate) has_active_conversation: bool,
     pub(crate) is_long_running: bool,
     pub(crate) agent_icon_status: Option<ConversationStatus>,
@@ -29,6 +43,10 @@ pub(crate) struct TerminalActivityStatusInputs<'a> {
 pub(crate) fn terminal_activity_status_from_inputs(
     inputs: TerminalActivityStatusInputs<'_>,
 ) -> Option<ConversationStatus> {
+    let cli_agent_output_active = inputs
+        .millis_since_last_output
+        .is_some_and(|ms| ms < CLI_AGENT_OUTPUT_QUIET_MS);
+
     // A non-rich CLI agent (e.g. Codex) can drive command-presence activity, but
     // only when gated on real output activity below. Its session status is an
     // unreliable one-way latch (it sticks at `InProgress` whenever the OSC9
@@ -37,18 +55,32 @@ pub(crate) fn terminal_activity_status_from_inputs(
     let command_detected_cli_session_can_drive_activity = inputs
         .cli_session
         .filter(|session| !matches!(session.agent, CLIAgent::Unknown))
-        .map_or(true, |session| {
+        .is_none_or(|session| {
             matches!(session.status, CLIAgentSessionStatus::InProgress)
                 && (!session.supports_rich_status() || matches!(session.agent, CLIAgent::Codex))
         });
 
-    if let Some(status) = inputs
+    if let Some(session) = inputs
         .cli_session
         .filter(|session| !matches!(session.agent, CLIAgent::Unknown))
         .filter(|session| cli_agent_session_drives_activity_status(session))
-        .and_then(activity_status_for_cli_agent_session)
     {
-        return Some(status);
+        if let Some(status) = activity_status_for_cli_agent_session(session) {
+            // Rich-agent idle backstop: a rich session's `InProgress` is a
+            // one-way latch cleared only by a best-effort `stop`/`idle_prompt`
+            // event. If those are lost the pane would stay "working" forever, so
+            // fall back to PTY quiet — a gap longer than the rich window means
+            // the agent has returned to an idle prompt. Only `InProgress` is
+            // gated this way; `Blocked`/`Success` are authoritative and pass
+            // through unchanged.
+            let idle_despite_latch = matches!(status, ConversationStatus::InProgress)
+                && inputs
+                    .millis_since_last_output
+                    .is_some_and(|ms| ms >= CLI_AGENT_RICH_IDLE_QUIET_MS);
+            if !idle_despite_latch {
+                return Some(status);
+            }
+        }
     }
 
     if let Some(status) = activity_status_from_terminal_conversation_status(
@@ -61,7 +93,7 @@ pub(crate) fn terminal_activity_status_from_inputs(
 
     if command_detected_cli_session_can_drive_activity
         && inputs.has_active_cli_agent_command
-        && inputs.cli_agent_output_active
+        && cli_agent_output_active
     {
         return Some(ConversationStatus::InProgress);
     }

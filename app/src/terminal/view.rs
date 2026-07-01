@@ -370,7 +370,7 @@ use crate::settings_view::keybindings::KeybindingChangedNotifier;
 use crate::settings_view::mcp_servers_page::MCPServersSettingsPage;
 use crate::settings_view::{flags, SettingsSection};
 use crate::shell_indicator::ShellIndicatorType;
-use crate::terminal::activity_status::CLI_AGENT_OUTPUT_QUIET_MS;
+use crate::terminal::activity_status::{CLI_AGENT_OUTPUT_QUIET_MS, CLI_AGENT_RICH_IDLE_QUIET_MS};
 use crate::terminal::alias::{check_for_alias_async, AliasedCommand};
 use crate::terminal::alt_screen::alt_screen_element::AltScreenElement;
 use crate::terminal::alt_screen::should_intercept_scroll;
@@ -2864,10 +2864,17 @@ pub struct TerminalView {
     /// it goes idle at its prompt.
     last_cli_agent_output_active: bool,
 
-    /// Pending one-shot task that re-evaluates CLI-agent output activity
-    /// `CLI_AGENT_OUTPUT_QUIET_MS` after the most recent PTY output. Needed
-    /// because `handle_terminal_wakeup` fires only on PTY output, so without it
-    /// the working->idle transition would never refresh the cached header color.
+    /// Last computed "rich CLI agent painting Working" state. A rich agent (e.g.
+    /// Claude) paints Working from its `InProgress` status latch, not from PTY
+    /// output, so its trailing edge (`CLI_AGENT_RICH_IDLE_QUIET_MS` of quiet
+    /// releasing a stuck latch) is tracked separately from
+    /// `last_cli_agent_output_active` and drives its own header refresh.
+    last_rich_cli_agent_working: bool,
+
+    /// Pending one-shot task that re-evaluates CLI-agent activity after the most
+    /// recent PTY output. Needed because `handle_terminal_wakeup` fires only on
+    /// PTY output, so without it the working->idle transition (non-rich output
+    /// window or rich idle backstop) would never refresh the cached header color.
     cli_agent_activity_refresh: Option<SpawnedFutureHandle>,
 
     agent_view_controller: ModelHandle<AgentViewController>,
@@ -4436,6 +4443,7 @@ impl TerminalView {
             cli_subagent_controller,
             use_agent_footer: use_agent_button_bar,
             last_cli_agent_output_active: false,
+            last_rich_cli_agent_working: false,
             cli_agent_activity_refresh: None,
             agent_view_controller,
             agent_view_back_button,
@@ -9669,44 +9677,24 @@ impl TerminalView {
             footer.notify_and_notify_children(ctx);
         });
 
-        // Keep the cached pane header color in sync with CLI-agent output
-        // activity. This hook fires both on real PTY output (leading edge ->
-        // red while streaming) and on the periodic long-running-process timer
-        // (trailing edge -> black ~CLI_AGENT_OUTPUT_QUIET_MS after output goes
-        // quiet), so a non-rich agent like Codex shows Working only while it is
-        // actually producing output. Re-render the cached pane config only on a
-        // transition, to avoid redundant updates.
-        let (has_cli_agent, millis_since_output) = {
-            let model = self.model.lock();
-            let has_cli_agent = CLIAgentSessionsModel::as_ref(ctx)
-                .session(self.view_id)
-                .is_some()
-                || self.active_block_has_cli_agent_command(&model, ctx);
-            (has_cli_agent, model.millis_since_last_output())
-        };
-        let cli_agent_output_active =
-            has_cli_agent && millis_since_output.is_some_and(|ms| ms < CLI_AGENT_OUTPUT_QUIET_MS);
-        if cli_agent_output_active != self.last_cli_agent_output_active {
-            self.last_cli_agent_output_active = cli_agent_output_active;
-            self.update_pane_configuration(ctx);
-        }
-        // `handle_terminal_wakeup` only fires on PTY output, so the working->idle
-        // trailing edge has no wakeup to refresh it. Schedule a one-shot timer to
-        // re-evaluate once output goes quiet; while output keeps flowing the timer
-        // is rescheduled (coalesced) and never fires, so an idle non-rich agent
-        // (e.g. Codex) returns to NotWorking after CLI_AGENT_OUTPUT_QUIET_MS.
-        if cli_agent_output_active {
-            self.schedule_cli_agent_activity_refresh(ctx);
-        }
+        // Keep the cached pane header color in sync with CLI-agent activity.
+        // This is the leading edge (fires on real PTY output); the helper also
+        // arms a trailing-edge timer so the pane returns to idle once output
+        // goes quiet — for a non-rich agent (Codex) after the short output
+        // window, and for a rich agent (Claude) after the longer backstop window
+        // that releases a status latch stuck by a lost `stop`/`idle_prompt`.
+        self.refresh_cli_agent_activity_color(ctx);
 
         // Need to re-render both the alt screen and the blocklist on keypresses.
         ctx.notify();
     }
 
     /// Schedules (or reschedules) the trailing-edge refresh that returns the pane
-    /// header to NotWorking once a non-rich CLI agent (e.g. Codex) stops producing
-    /// output. Coalesces: each call aborts the previous pending timer, so while
-    /// output keeps flowing the timer is pushed forward and never fires.
+    /// header to NotWorking once a CLI agent stops producing output. Coalesces:
+    /// each call aborts the previous pending timer, so while output keeps flowing
+    /// the timer is pushed forward and never fires. The fixed re-arm interval
+    /// polls until the relevant window elapses — the short output window for a
+    /// non-rich agent (Codex), the longer backstop window for a rich agent.
     fn schedule_cli_agent_activity_refresh(&mut self, ctx: &mut ViewContext<Self>) {
         if let Some(handle) = self.cli_agent_activity_refresh.take() {
             handle.abort();
@@ -9719,29 +9707,53 @@ impl TerminalView {
         ));
     }
 
-    /// Re-evaluates CLI-agent output activity (driven by the trailing-edge timer
-    /// from [`Self::schedule_cli_agent_activity_refresh`]) and refreshes the cached
-    /// pane header color if it changed, so an idle agent returns to black after
-    /// `CLI_AGENT_OUTPUT_QUIET_MS` of quiet. If output is somehow still active at
-    /// the deadline, it re-arms so the eventual trailing edge is not missed.
+    /// Re-evaluates CLI-agent activity and refreshes the cached pane header color
+    /// on a transition. Shared by the leading edge (`handle_terminal_wakeup`, on
+    /// PTY output) and the trailing-edge timer from
+    /// [`Self::schedule_cli_agent_activity_refresh`].
+    ///
+    /// Two independent signals can paint the pane Working:
+    /// - a non-rich agent (e.g. Codex) while its PTY output is within
+    ///   `CLI_AGENT_OUTPUT_QUIET_MS` (output is its only reliable signal);
+    /// - a rich agent (e.g. Claude) whose status latch is `InProgress`, until its
+    ///   PTY has been quiet for `CLI_AGENT_RICH_IDLE_QUIET_MS` — the backstop that
+    ///   releases a latch stuck by a lost `stop`/`idle_prompt` event.
+    ///
+    /// The timer re-arms while either signal is still live so the eventual
+    /// trailing edge is not missed, and is cancelled once both have settled.
     fn refresh_cli_agent_activity_color(&mut self, ctx: &mut ViewContext<Self>) {
-        self.cli_agent_activity_refresh = None;
-        let (has_cli_agent, millis_since_output) = {
+        let (has_cli_agent, rich_in_progress, millis_since_output) = {
             let model = self.model.lock();
-            let has_cli_agent = CLIAgentSessionsModel::as_ref(ctx)
-                .session(self.view_id)
-                .is_some()
-                || self.active_block_has_cli_agent_command(&model, ctx);
-            (has_cli_agent, model.millis_since_last_output())
+            let session = CLIAgentSessionsModel::as_ref(ctx).session(self.view_id);
+            let has_cli_agent =
+                session.is_some() || self.active_block_has_cli_agent_command(&model, ctx);
+            let rich_in_progress = session.is_some_and(|session| {
+                session.supports_rich_status()
+                    && matches!(session.status, CLIAgentSessionStatus::InProgress)
+            });
+            (
+                has_cli_agent,
+                rich_in_progress,
+                model.millis_since_last_output(),
+            )
         };
         let cli_agent_output_active =
             has_cli_agent && millis_since_output.is_some_and(|ms| ms < CLI_AGENT_OUTPUT_QUIET_MS);
-        if cli_agent_output_active != self.last_cli_agent_output_active {
+        let rich_working = rich_in_progress
+            && millis_since_output.is_some_and(|ms| ms < CLI_AGENT_RICH_IDLE_QUIET_MS);
+
+        if cli_agent_output_active != self.last_cli_agent_output_active
+            || rich_working != self.last_rich_cli_agent_working
+        {
             self.last_cli_agent_output_active = cli_agent_output_active;
+            self.last_rich_cli_agent_working = rich_working;
             self.update_pane_configuration(ctx);
         }
-        if cli_agent_output_active {
+
+        if cli_agent_output_active || rich_working {
             self.schedule_cli_agent_activity_refresh(ctx);
+        } else if let Some(handle) = self.cli_agent_activity_refresh.take() {
+            handle.abort();
         }
     }
 

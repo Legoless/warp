@@ -45,7 +45,7 @@ use crate::settings::app_installation_detection::{
 use crate::settings::{PaneColorMode, PaneSettings};
 use crate::terminal::activity_status::{
     pane_activity_state_for_status, terminal_activity_status_from_inputs,
-    TerminalActivityStatusInputs, CLI_AGENT_OUTPUT_QUIET_MS,
+    TerminalActivityStatusInputs,
 };
 use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
 use crate::terminal::shared_session::participant_avatar_view::render_participants_and_role_elements;
@@ -215,13 +215,13 @@ impl TerminalView {
         ctx: &AppContext,
         agent_icon_status: Option<ConversationStatus>,
     ) -> Option<ConversationStatus> {
-        let (has_active_cli_agent_command, cli_agent_output_active) = {
+        let (has_active_cli_agent_command, millis_since_last_output) = {
             let model = self.model.lock();
             let has_active_cli_agent_command = self.active_block_has_cli_agent_command(&model, ctx);
-            let cli_agent_output_active = model
-                .millis_since_last_output()
-                .is_some_and(|ms| ms < CLI_AGENT_OUTPUT_QUIET_MS);
-            (has_active_cli_agent_command, cli_agent_output_active)
+            (
+                has_active_cli_agent_command,
+                model.millis_since_last_output(),
+            )
         };
 
         terminal_activity_status_from_inputs(TerminalActivityStatusInputs {
@@ -230,7 +230,7 @@ impl TerminalView {
             is_ambient: self.is_ambient_agent_session(ctx),
             selected_conversation_status: self.selected_conversation_status_for_display(ctx),
             has_active_cli_agent_command,
-            cli_agent_output_active,
+            millis_since_last_output,
             has_active_conversation: BlocklistAIHistoryModel::as_ref(ctx)
                 .active_conversation(self.view_id)
                 .is_some(),

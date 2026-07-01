@@ -61,7 +61,7 @@ fn terminal_activity_treats_absent_agent_icon_status_as_idle() {
         is_ambient: false,
         selected_conversation_status: None,
         has_active_cli_agent_command: false,
-        cli_agent_output_active: false,
+        millis_since_last_output: None,
         has_active_conversation: false,
         is_long_running: false,
         agent_icon_status: None,
@@ -81,7 +81,7 @@ fn terminal_activity_uses_rich_agent_icon_status_as_last_fallback() {
         is_ambient: false,
         selected_conversation_status: None,
         has_active_cli_agent_command: false,
-        cli_agent_output_active: false,
+        millis_since_last_output: None,
         has_active_conversation: false,
         is_long_running: false,
         agent_icon_status: Some(ConversationStatus::InProgress),
@@ -178,7 +178,7 @@ fn terminal_activity_does_not_restore_suppressed_cli_session_status_from_icon_st
         is_ambient: false,
         selected_conversation_status: None,
         has_active_cli_agent_command: false,
-        cli_agent_output_active: false,
+        millis_since_last_output: None,
         has_active_conversation: false,
         is_long_running: false,
         agent_icon_status: Some(ConversationStatus::InProgress),
@@ -249,7 +249,7 @@ fn terminal_activity_prefers_conversation_status_over_command_detected_status() 
         is_ambient: false,
         selected_conversation_status: Some(ConversationStatus::Success),
         has_active_cli_agent_command: true,
-        cli_agent_output_active: true,
+        millis_since_last_output: Some(0),
         has_active_conversation: true,
         is_long_running: true,
         agent_icon_status: None,
@@ -270,7 +270,7 @@ fn terminal_activity_uses_command_detected_running_agent_when_output_is_active()
         is_ambient: false,
         selected_conversation_status: None,
         has_active_cli_agent_command: true,
-        cli_agent_output_active: true,
+        millis_since_last_output: Some(0),
         has_active_conversation: false,
         is_long_running: true,
         agent_icon_status: None,
@@ -290,7 +290,7 @@ fn terminal_activity_command_detected_agent_is_idle_without_output() {
         is_ambient: false,
         selected_conversation_status: None,
         has_active_cli_agent_command: true,
-        cli_agent_output_active: false,
+        millis_since_last_output: None,
         has_active_conversation: false,
         is_long_running: true,
         agent_icon_status: None,
@@ -320,7 +320,7 @@ fn terminal_activity_non_rich_agent_working_only_while_output_is_active() {
         is_ambient: false,
         selected_conversation_status: None,
         has_active_cli_agent_command: true,
-        cli_agent_output_active: true,
+        millis_since_last_output: Some(0),
         has_active_conversation: false,
         is_long_running: true,
         agent_icon_status: None,
@@ -337,7 +337,7 @@ fn terminal_activity_non_rich_agent_working_only_while_output_is_active() {
         is_ambient: false,
         selected_conversation_status: None,
         has_active_cli_agent_command: true,
-        cli_agent_output_active: false,
+        millis_since_last_output: None,
         has_active_conversation: false,
         is_long_running: true,
         agent_icon_status: None,
@@ -364,7 +364,7 @@ fn terminal_activity_does_not_use_command_detection_after_non_rich_session_finis
         is_ambient: false,
         selected_conversation_status: None,
         has_active_cli_agent_command: true,
-        cli_agent_output_active: true,
+        millis_since_last_output: Some(0),
         has_active_conversation: false,
         is_long_running: true,
         agent_icon_status: None,
@@ -374,6 +374,89 @@ fn terminal_activity_does_not_use_command_detection_after_non_rich_session_finis
     assert_eq!(
         pane_activity_state_for_status(status.as_ref()),
         PaneActivityState::NotWorking
+    );
+}
+
+#[test]
+fn terminal_activity_rich_agent_stays_working_while_output_recent() {
+    // A rich Claude session whose status latch is InProgress keeps painting
+    // Working as long as its PTY is still producing output within the rich
+    // backstop window (its TUI animates while a turn runs).
+    let session = cli_agent_session(CLIAgentSessionStatus::InProgress, Some("fix this"));
+
+    let status = terminal_activity_status_from_inputs(TerminalActivityStatusInputs {
+        cli_session: Some(&session),
+        has_terminal_conversation: false,
+        is_ambient: false,
+        selected_conversation_status: None,
+        has_active_cli_agent_command: true,
+        millis_since_last_output: Some(CLI_AGENT_RICH_IDLE_QUIET_MS - 1),
+        has_active_conversation: false,
+        is_long_running: true,
+        agent_icon_status: None,
+    });
+
+    assert_eq!(status, Some(ConversationStatus::InProgress));
+    assert_eq!(
+        pane_activity_state_for_status(status.as_ref()),
+        PaneActivityState::Working
+    );
+}
+
+#[test]
+fn terminal_activity_rich_agent_idle_after_backstop_when_stop_missed() {
+    // Core backstop test: a rich Claude session is latched InProgress because
+    // its `stop`/`idle_prompt` event was lost, but its PTY has been quiet past
+    // the rich window. The pane must read as NotWorking rather than staying red
+    // forever, without any plugin event.
+    let session = cli_agent_session(CLIAgentSessionStatus::InProgress, Some("fix this"));
+
+    let status = terminal_activity_status_from_inputs(TerminalActivityStatusInputs {
+        cli_session: Some(&session),
+        has_terminal_conversation: false,
+        is_ambient: false,
+        selected_conversation_status: None,
+        has_active_cli_agent_command: true,
+        millis_since_last_output: Some(CLI_AGENT_RICH_IDLE_QUIET_MS),
+        has_active_conversation: false,
+        is_long_running: true,
+        agent_icon_status: None,
+    });
+
+    assert_eq!(status, None);
+    assert_eq!(
+        pane_activity_state_for_status(status.as_ref()),
+        PaneActivityState::NotWorking
+    );
+}
+
+#[test]
+fn terminal_activity_rich_agent_blocked_ignores_idle_backstop() {
+    // The backstop only releases a stuck InProgress. A Blocked rich session
+    // (awaiting a permission/question) must keep driving the attention UI even
+    // after a long quiet period.
+    let session = cli_agent_session(
+        CLIAgentSessionStatus::Blocked {
+            message: Some("Wants to run bash: rm -rf /tmp".to_owned()),
+        },
+        Some("fix this"),
+    );
+
+    let status = terminal_activity_status_from_inputs(TerminalActivityStatusInputs {
+        cli_session: Some(&session),
+        has_terminal_conversation: false,
+        is_ambient: false,
+        selected_conversation_status: None,
+        has_active_cli_agent_command: false,
+        millis_since_last_output: Some(CLI_AGENT_RICH_IDLE_QUIET_MS * 100),
+        has_active_conversation: false,
+        is_long_running: false,
+        agent_icon_status: None,
+    });
+
+    assert_eq!(
+        pane_activity_state_for_status(status.as_ref()),
+        PaneActivityState::RequiresAttention
     );
 }
 
