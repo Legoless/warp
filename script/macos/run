@@ -144,7 +144,28 @@ if [[ ",$FEATURES," =~ ",warp_control_cli," ]]; then
 fi
 
 echo "Codesigning app..."
-SIGNING_CERT="$(security find-identity -p codesigning -v | grep "Apple Development" | awk '{print $2}' | head -1)"
+# Prefer a Developer ID cert: its designated requirement is team-pinned, so
+# macOS TCC/privacy grants (e.g. Downloads folder access) survive rebuilds.
+# Apple Development / ad-hoc signatures change the requirement on every re-sign,
+# forcing you to re-grant permissions each build. Mirrors script/macos/bundle.
+SIGNING_CERT="$(security find-identity -p codesigning -v | grep "Developer ID Application" | awk '{print $2}' | head -1)"
+if [[ -z "$SIGNING_CERT" ]]; then
+  # Fall back to Apple Development, then ad-hoc ("-"). Both pin the requirement to
+  # the leaf cert CN / cdhash rather than the team, so they change on every rebuild
+  # and any Downloads/Full Disk Access grant you make will reset each `./script/run`.
+  # Warn loudly rather than silently reintroduce that footgun.
+  SIGNING_CERT="$(security find-identity -p codesigning -v | grep "Apple Development" | awk '{print $2}' | head -1)"
+  cat >&2 <<'EOF'
+warning: no "Developer ID Application" identity found — signing WarpLocal with an
+         Apple Development / ad-hoc signature. macOS ties privacy grants (Downloads,
+         Desktop, Full Disk Access) to the code signature's designated requirement,
+         which changes on every rebuild for these identities. Expect "Operation not
+         permitted" to return after each build. To make grants persist, create a stable
+         code-signing identity once (Keychain Access -> Certificate Assistant -> Create
+         a Certificate -> Identity Type: Self Signed Root, Certificate Type: Code
+         Signing; then set it to Always Trust), or install a Developer ID cert.
+EOF
+fi
 codesign --force --deep --options runtime --sign "${SIGNING_CERT:--}" "$WARP_APP_PATH" --entitlements script/Debug-Entitlements.plist
 
 if [ "$DONT_OPEN" = false ] ; then

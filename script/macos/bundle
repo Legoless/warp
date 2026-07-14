@@ -739,6 +739,11 @@ if [[ $SELFSIGN = true ]]; then
   SIGNING_CERT="$(security find-identity -p codesigning -v | grep "Developer ID Application" | awk '{print $2}' | head -1)"
   if [[ -z "$SIGNING_CERT" ]]; then
     SIGNING_CERT="$(security find-identity -p codesigning -v | grep "Apple Development" | awk '{print $2}' | head -1)"
+    if [[ -n "$SIGNING_CERT" ]]; then
+      echo "warning: no Developer ID cert; self-signing with Apple Development. macOS ties" >&2
+      echo "         privacy grants (Downloads/Full Disk Access) to the team-pinned Developer" >&2
+      echo "         ID requirement, so this build's grants will reset on every rebuild." >&2
+    fi
   fi
   if [[ -z "$SIGNING_CERT" ]]; then
     echo "No Developer ID or Apple Development cert found, falling back to ad-hoc signing."

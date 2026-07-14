@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements for a locally distributed, Developer ID-signed, notarizable build
+  (e.g. WarpOss installed to /Applications). Identical to Entitlements.plist but
+  WITHOUT com.apple.security.application-groups: that group is prefixed with
+  Warp's official team id (2BBY89MBSN) and cannot be signed by another team.
+  Also carries no com.apple.security.get-task-allow, which notarization forbids —
+  so a build signed with this is non-debug and TCC grants (Screen Recording,
+  Downloads, ...) bind to a stable team-pinned designated requirement.
+-->
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.automation.apple-events</key>
+	<true/>
+    <key>com.apple.security.device.audio-input</key>
+	<true/>
+	<key>com.apple.security.device.camera</key>
+	<true/>
+    <key>com.apple.security.personal-information.addressbook</key>
+	<true/>
+	<key>com.apple.security.personal-information.calendars</key>
+	<true/>
+	<key>com.apple.security.personal-information.location</key>
+	<true/>
+	<key>com.apple.security.personal-information.photos-library</key>
+	<true/>
+</dict>
+</plist>
