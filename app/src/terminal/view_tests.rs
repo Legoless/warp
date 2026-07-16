@@ -9155,3 +9155,42 @@ fn cmd_k_in_agent_view_cancels_in_progress_conversation_and_starts_new_one() {
         });
     })
 }
+
+#[test]
+fn activity_color_identifier_for_chrome_follows_pane_color_mode() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+                sessions.set_session(
+                    view.view_id,
+                    cli_agent_session_with_query(
+                        CLIAgent::Claude,
+                        CLIAgentSessionStatus::InProgress,
+                        true,
+                        "fix this",
+                    ),
+                    ctx,
+                );
+            });
+
+            // Off by default: neither pane chrome nor tab rows get an activity color.
+            assert_eq!(view.activity_color_identifier_for_chrome(ctx), None);
+
+            PaneSettings::handle(ctx).update(ctx, |pane_settings, ctx| {
+                pane_settings
+                    .pane_color_mode
+                    .set_value(PaneColorMode::Activity, ctx)
+                    .expect("pane color mode should update");
+            });
+
+            // A working Claude session resolves to the Working activity color.
+            assert_eq!(
+                view.activity_color_identifier_for_chrome(ctx),
+                Some(PaneActivityState::Working.default_color())
+            );
+        });
+    })
+}

@@ -184,6 +184,16 @@ define_settings_group!(PaneSettings, settings: [
         toml_path: "appearance.panes.activity_background",
         description: "Whether activity colors tint pane backgrounds.",
     },
+    tab_activity_background: TabActivityBackground {
+        type: bool,
+        default: false,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
+        private: false,
+        toml_path: "appearance.panes.tab_activity_background",
+        description: "Whether activity colors tint vertical tab rows without a custom tab color.",
+    },
     pane_activity_colors: PaneActivityColors,
 ]);
 

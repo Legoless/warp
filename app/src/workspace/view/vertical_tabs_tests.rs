@@ -13,8 +13,8 @@ use super::{
     push_normalized_unique_summary_label, search_fragments_contain_query,
     select_summary_pane_kind_icons, should_keep_detail_sidecar_visible_for_mouse_position,
     should_show_tab_group_header, sort_summary_primary_labels_status_first, summary_overflow_count,
-    summary_search_text_fragments, terminal_kind_badge_label, terminal_primary_line_data,
-    terminal_pull_request_badge_label, terminal_search_text_fragments,
+    summary_search_text_fragments, terminal_kind_badge_label, terminal_pane_tab_color,
+    terminal_primary_line_data, terminal_pull_request_badge_label, terminal_search_text_fragments,
     terminal_title_fallback_font, uses_outer_group_container, visible_pane_ids_for_detail_target,
     vtab_diff_stats_text, AgentTabTextPreference, SummaryPaneKind, SummaryPaneKindIcons,
     TerminalAgentText, TerminalPrimaryLineData, TerminalPrimaryLineFont, VerticalTabsDetailTarget,
@@ -1206,4 +1206,30 @@ fn summary_search_fragments_include_hidden_overflow_values() {
     assert!(search_fragments_contain_query(&fragments, "#789"));
     assert!(search_fragments_contain_query(&fragments, "+2"));
     assert!(search_fragments_contain_query(&fragments, "-3"));
+}
+
+#[test]
+fn terminal_pane_tab_color_prefers_directory_color_over_activity() {
+    use warp_core::ui::theme::AnsiColorIdentifier;
+
+    assert_eq!(
+        terminal_pane_tab_color(Some(AnsiColorIdentifier::Blue), true, || Some(
+            AnsiColorIdentifier::Red
+        )),
+        Some(AnsiColorIdentifier::Blue)
+    );
+}
+
+#[test]
+fn terminal_pane_tab_color_uses_activity_only_when_enabled() {
+    use warp_core::ui::theme::AnsiColorIdentifier;
+
+    assert_eq!(
+        terminal_pane_tab_color(None, true, || Some(AnsiColorIdentifier::Red)),
+        Some(AnsiColorIdentifier::Red)
+    );
+    assert_eq!(
+        terminal_pane_tab_color(None, false, || Some(AnsiColorIdentifier::Red)),
+        None
+    );
 }

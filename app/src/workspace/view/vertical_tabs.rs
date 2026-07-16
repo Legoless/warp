@@ -55,6 +55,7 @@ use crate::pane_group::{
     CodePane, NotebookPane, PaneGroup, PaneId, TabBarHoverIndex, TerminalPane, WorkflowPane,
 };
 use crate::safe_triangle::SafeTriangle;
+use crate::settings::PaneSettings;
 use crate::tab::{tab_position_id, SelectedTabColor, TabData};
 use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
 use crate::terminal::session_settings::SessionSettings;
@@ -5487,11 +5488,22 @@ fn render_pull_request_badge_content(label: &str, appearance: &Appearance) -> Bo
         .finish()
 }
 
+/// Resolves a terminal pane's tab-row color source: an explicit directory color
+/// always wins; the opt-in activity tint only fills panes without one, so it
+/// never overrides user-chosen colors.
+fn terminal_pane_tab_color(
+    dir_color: Option<AnsiColorIdentifier>,
+    tab_activity_background: bool,
+    activity_color: impl FnOnce() -> Option<AnsiColorIdentifier>,
+) -> Option<AnsiColorIdentifier> {
+    dir_color.or_else(|| tab_activity_background.then(activity_color).flatten())
+}
+
 /// Resolves the rendered color mode for a tab's panes from the tab's own color,
 /// whether or not it's in a group: a manual `selected_color` override applies to
-/// the whole tab, otherwise it falls through to per-pane directory colors. A
-/// group's color tints the group container separately and does not override its
-/// members.
+/// the whole tab, otherwise it falls through to per-pane directory colors (with
+/// the opt-in activity tint filling uncolored terminal panes). A group's color
+/// tints the group container separately and does not override its members.
 fn compute_tab_group_color_mode(
     tab: &TabData,
     pane_group: &PaneGroup,
@@ -5513,18 +5525,23 @@ fn compute_tab_group_color_mode(
         .directory_tab_colors
         .value()
         .clone();
+    let tab_activity_background = *PaneSettings::as_ref(app).tab_activity_background;
     let per_pane: HashMap<PaneId, Option<AnsiColorIdentifier>> = visible_pane_ids
         .iter()
         .map(|&pane_id| {
             let color = if let Some(tv) = pane_group.terminal_view_from_pane_id(pane_id, app) {
+                let terminal_view = tv.as_ref(app);
                 // Terminal pane: determine color from CWD.
-                tv.as_ref(app)
+                let dir_color = terminal_view
                     .canonical_session_pwd_if_local(app)
                     .and_then(|cwd| {
                         dir_colors
                             .color_for_directory(cwd.as_path())
                             .and_then(|c| c.ansi_color())
-                    })
+                    });
+                terminal_pane_tab_color(dir_color, tab_activity_background, || {
+                    terminal_view.activity_color_identifier_for_chrome(app)
+                })
             } else if let Some(code_view) = pane_group.code_view_from_pane_id(pane_id, app) {
                 // Code pane: determine color from the open file path using longest-prefix
                 // matching against configured directories, so e.g. warp-internal/code.rs

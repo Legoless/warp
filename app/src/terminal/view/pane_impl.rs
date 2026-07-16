@@ -3,6 +3,7 @@
 use pathfinder_color::ColorU;
 use settings::Setting as _;
 use warp_core::context_flag::ContextFlag;
+use warp_core::ui::theme::AnsiColorIdentifier;
 use warpui::elements::{
     ConstrainedBox, CrossAxisAlignment, Empty, Flex, MainAxisAlignment, MainAxisSize,
     ParentElement, Shrinkable,
@@ -178,6 +179,21 @@ impl TerminalView {
     }
 
     fn pane_activity_color(&self, ctx: &ViewContext<Self>) -> Option<ColorU> {
+        let activity_color = self.activity_color_identifier_for_chrome(ctx)?;
+        Some(
+            activity_color
+                .to_ansi_color(&Appearance::as_ref(ctx).theme().terminal_colors().normal)
+                .into(),
+        )
+    }
+
+    /// Resolves the activity color identifier for this terminal's chrome. Shared by
+    /// the pane surfaces (header/background) and vertical tab rows so they cannot
+    /// drift on which color a status maps to. `None` when pane coloring is off.
+    pub(crate) fn activity_color_identifier_for_chrome(
+        &self,
+        ctx: &AppContext,
+    ) -> Option<AnsiColorIdentifier> {
         let pane_settings = PaneSettings::as_ref(ctx);
         if pane_settings.pane_color_mode != PaneColorMode::Activity {
             return None;
@@ -189,14 +205,11 @@ impl TerminalView {
             self.activity_status_for_chrome(ctx)
         };
         let activity_state = pane_activity_state_for_status(activity_status.as_ref());
-        let activity_color = pane_settings
-            .pane_activity_colors
-            .value()
-            .color_for(activity_state);
         Some(
-            activity_color
-                .to_ansi_color(&Appearance::as_ref(ctx).theme().terminal_colors().normal)
-                .into(),
+            pane_settings
+                .pane_activity_colors
+                .value()
+                .color_for(activity_state),
         )
     }
 

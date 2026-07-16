@@ -65,7 +65,8 @@ use crate::settings::{
     FocusPaneOnHover, FontSettings, FontSettingsChangedEvent, GPUSettings, InputBoxType,
     InputModeSettings, InputModeState, InputSettings, InputSettingsChangedEvent, MonospaceFontName,
     PaneActivityBackground, PaneActivityColors, PaneActivityState, PaneColorMode, PaneSettings,
-    PaneSettingsChangedEvent, ShouldDimInactivePanes, ThemeSettings, UseSystemTheme, UseThinStrokes,
+    PaneSettingsChangedEvent, ShouldDimInactivePanes, TabActivityBackground, ThemeSettings,
+    UseSystemTheme, UseThinStrokes,
     DEFAULT_MONOSPACE_FONT_NAME,
 };
 use crate::terminal::block_list_viewport::InputMode;
@@ -548,6 +549,7 @@ pub enum AppearancePageAction {
     ToggleFocusPaneOnHover,
     SetPaneColorMode(PaneColorMode),
     TogglePaneActivityBackground,
+    ToggleTabActivityBackground,
     SetPaneActivityColor {
         activity: PaneActivityState,
         color: AnsiColorIdentifier,
@@ -754,6 +756,14 @@ impl TypedActionView for AppearanceSettingsPageView {
                 PaneSettings::handle(ctx).update(ctx, |pane_settings, ctx| {
                     report_if_error!(pane_settings
                         .pane_activity_background
+                        .toggle_and_save_value(ctx));
+                });
+                ctx.notify();
+            }
+            ToggleTabActivityBackground => {
+                PaneSettings::handle(ctx).update(ctx, |pane_settings, ctx| {
+                    report_if_error!(pane_settings
+                        .tab_activity_background
                         .toggle_and_save_value(ctx));
                 });
                 ctx.notify();
@@ -3941,6 +3951,7 @@ impl SettingsWidget for PromptWidget {
 #[derive(Default)]
 struct PaneColorModeWidget {
     activity_background_switch_state: SwitchStateHandle,
+    tab_activity_background_switch_state: SwitchStateHandle,
 }
 
 impl SettingsWidget for PaneColorModeWidget {
@@ -3999,6 +4010,34 @@ impl SettingsWidget for PaneColorModeWidget {
                 Some("Apply activity colors behind pane content.".into()),
             );
 
+            let tab_activity_background_toggle = render_body_item::<AppearancePageAction>(
+                "Color tab background".into(),
+                None,
+                LocalOnlyIconState::for_setting(
+                    TabActivityBackground::storage_key(),
+                    TabActivityBackground::sync_to_cloud(),
+                    &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                    app,
+                ),
+                ToggleState::Enabled,
+                appearance,
+                appearance
+                    .ui_builder()
+                    .switch(self.tab_activity_background_switch_state.clone())
+                    .check(*pane_settings.tab_activity_background)
+                    .build()
+                    .on_click(move |ctx, _, _| {
+                        ctx.dispatch_typed_action(
+                            AppearancePageAction::ToggleTabActivityBackground,
+                        );
+                    })
+                    .finish(),
+                Some(
+                    "Apply activity colors to vertical tab rows without a custom tab color."
+                        .into(),
+                ),
+            );
+
             let mut rows = Flex::column().with_spacing(8.);
             let colors = pane_settings.pane_activity_colors.value();
             for activity in PaneActivityState::ALL {
@@ -4012,6 +4051,7 @@ impl SettingsWidget for PaneColorModeWidget {
             }
             let activity_settings = Flex::column()
                 .with_child(activity_background_toggle)
+                .with_child(tab_activity_background_toggle)
                 .with_child(
                     Container::new(rows.finish())
                         .with_padding_bottom(HEADER_PADDING)
