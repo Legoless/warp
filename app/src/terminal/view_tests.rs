@@ -12,6 +12,8 @@ use session_sharing_protocol::common::CLIAgentSessionState;
 use warp_cli::agent::Harness;
 use warp_terminal::model::escape_sequences::{BRACKETED_PASTE_END, BRACKETED_PASTE_START, C0};
 use warpui::notification::UserNotification;
+use warpui::windowing::state::ApplicationStage;
+use warpui::windowing::WindowManager;
 use warpui::platform::WindowStyle;
 use warpui::{App, EntityIdSet, Presenter, ReadModel, WindowInvalidation};
 
@@ -8165,5 +8167,58 @@ fn cmd_k_in_agent_view_cancels_in_progress_conversation_and_starts_new_one() {
                 "the old in-progress conversation must be Cancelled after cmd-k"
             );
         });
+    })
+}
+
+#[test]
+fn bell_records_dock_badge_only_when_terminal_is_not_viewed() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let (window_id, terminal) = add_window_with_id_and_terminal(&mut app, None);
+
+        // Viewed: focused terminal in the active window — a bell does not badge.
+        app.update(|ctx| {
+            WindowManager::handle(ctx).update(ctx, |state, ctx| {
+                state.overwrite_for_test(ApplicationStage::Active, Some(window_id));
+                ctx.notify();
+            });
+        });
+        terminal.update(&mut app, |view, ctx| {
+            view.focus_terminal(ctx);
+        });
+        terminal.update(&mut app, |view, ctx| {
+            view.handle_terminal_event(&ModelEvent::Bell, ctx);
+        });
+        assert_eq!(app.dock_badge_count(), 0);
+
+        // Unviewed: the window is no longer active — the bell counts.
+        app.update(|ctx| {
+            WindowManager::handle(ctx).update(ctx, |state, ctx| {
+                state.overwrite_for_test(ApplicationStage::Inactive, None);
+                ctx.notify();
+            });
+        });
+        terminal.update(&mut app, |view, ctx| {
+            view.handle_terminal_event(&ModelEvent::Bell, ctx);
+        });
+        assert_eq!(app.dock_badge_count(), 1);
+
+        // Repeat bells from the same terminal still badge once.
+        terminal.update(&mut app, |view, ctx| {
+            view.handle_terminal_event(&ModelEvent::Bell, ctx);
+        });
+        assert_eq!(app.dock_badge_count(), 1);
+
+        // Viewing the terminal again (focus in the active window) clears the badge.
+        app.update(|ctx| {
+            WindowManager::handle(ctx).update(ctx, |state, ctx| {
+                state.overwrite_for_test(ApplicationStage::Active, Some(window_id));
+                ctx.notify();
+            });
+        });
+        AgentNotificationsModel::handle(&app).update(&mut app, |model, ctx| {
+            model.mark_items_from_terminal_view_read(terminal.id(), ctx);
+        });
+        assert_eq!(app.dock_badge_count(), 0);
     })
 }

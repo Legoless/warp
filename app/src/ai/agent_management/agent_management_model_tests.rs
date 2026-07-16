@@ -908,3 +908,88 @@ fn in_progress_resume_clears_stale_notification_and_adds_none() {
         });
     });
 }
+
+#[test]
+fn dock_badge_counts_belled_terminal_once_and_clears_when_viewed() {
+    App::test((), |mut app| async move {
+        let (_history, notifications) = setup_app(&mut app);
+
+        let terminal_view_id = EntityId::new();
+        notifications.update(&mut app, |model, ctx| {
+            model.record_terminal_bell(terminal_view_id, ctx);
+            model.record_terminal_bell(terminal_view_id, ctx);
+        });
+        assert_eq!(app.dock_badge_count(), 1);
+
+        // Viewing the terminal clears its bell entry even with HOA notifications disabled.
+        notifications.update(&mut app, |model, ctx| {
+            model.mark_items_from_terminal_view_read(terminal_view_id, ctx);
+        });
+        assert_eq!(app.dock_badge_count(), 0);
+    });
+}
+
+#[test]
+fn dock_badge_dedupes_bell_and_notification_for_same_terminal() {
+    App::test((), |mut app| async move {
+        let _guard = FeatureFlag::HOANotifications.override_enabled(true);
+        let (_history, notifications) = setup_app(&mut app);
+        disable_telemetry_path(&mut app);
+
+        let terminal_view_id = EntityId::new();
+        notifications.update(&mut app, |model, ctx| {
+            model.add_notification(
+                "Claude task".to_owned(),
+                "Task completed.".to_owned(),
+                NotificationCategory::Complete,
+                NotificationSourceAgent::CLI {
+                    agent: CLIAgent::Claude,
+                    is_ambient: false,
+                },
+                NotificationOrigin::CLISession(terminal_view_id),
+                terminal_view_id,
+                vec![],
+                None,
+                ctx,
+            );
+            model.record_terminal_bell(terminal_view_id, ctx);
+        });
+        // The same terminal has an unread notification and an unviewed bell: badge once.
+        assert_eq!(app.dock_badge_count(), 1);
+
+        let other_terminal = EntityId::new();
+        notifications.update(&mut app, |model, ctx| {
+            model.record_terminal_bell(other_terminal, ctx);
+        });
+        assert_eq!(app.dock_badge_count(), 2);
+
+        // Viewing the first terminal clears both its bell and its unread notification.
+        notifications.update(&mut app, |model, ctx| {
+            model.mark_items_from_terminal_view_read(terminal_view_id, ctx);
+        });
+        assert_eq!(app.dock_badge_count(), 1);
+
+        notifications.update(&mut app, |model, ctx| {
+            model.clear_terminal_bell(other_terminal, ctx);
+        });
+        assert_eq!(app.dock_badge_count(), 0);
+    });
+}
+
+#[test]
+fn mark_all_items_read_clears_belled_terminals() {
+    App::test((), |mut app| async move {
+        let (_history, notifications) = setup_app(&mut app);
+
+        notifications.update(&mut app, |model, ctx| {
+            model.record_terminal_bell(EntityId::new(), ctx);
+            model.record_terminal_bell(EntityId::new(), ctx);
+        });
+        assert_eq!(app.dock_badge_count(), 2);
+
+        notifications.update(&mut app, |model, ctx| {
+            model.mark_all_items_read(ctx);
+        });
+        assert_eq!(app.dock_badge_count(), 0);
+    });
+}

@@ -258,3 +258,21 @@ fn dock_badge_count_updates_after_read_all_and_remove() {
     assert!(items.mark_all_items_read());
     assert_eq!(items.dock_badge_count(), 0);
 }
+
+#[test]
+fn dock_badge_count_counts_terminals_not_items() {
+    let mut items = NotificationItems::default();
+    let terminal_view_id = EntityId::new();
+
+    items.push(make_conversation_notification(
+        AIConversationId::new(),
+        terminal_view_id,
+    ));
+    items.push(make_conversation_notification(
+        AIConversationId::new(),
+        terminal_view_id,
+    ));
+
+    assert_eq!(items.filtered_count(NotificationFilter::Unread), 2);
+    assert_eq!(items.dock_badge_count(), 1);
+}

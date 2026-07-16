@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use warp_core::features::FeatureFlag;
 use warpui::{AppContext, Entity, EntityId, ModelContext, SingletonEntity, ViewHandle, WindowId};
@@ -28,6 +28,9 @@ pub struct AgentNotificationsModel {
     /// Artifacts accumulated during the current turn for each conversation.
     /// Drained into the notification when a terminal state fires, cleared on InProgress.
     pub(crate) pending_artifacts: HashMap<AIConversationId, Vec<Artifact>>,
+    /// Terminals that rang the bell while not viewed, reflected in the Dock badge
+    /// until the terminal is viewed, its shell exits, or its pane closes (GH-11095).
+    belled_terminals: HashSet<EntityId>,
 }
 
 impl Entity for AgentNotificationsModel {
@@ -56,6 +59,7 @@ impl AgentNotificationsModel {
         let model = Self {
             notifications: NotificationItems::default(),
             pending_artifacts: HashMap::new(),
+            belled_terminals: HashSet::new(),
         };
         model.update_dock_badge(ctx);
         model
@@ -73,9 +77,34 @@ impl AgentNotificationsModel {
     }
 
     pub(crate) fn mark_all_items_read(&mut self, ctx: &mut ModelContext<Self>) {
-        if self.notifications.mark_all_items_read() {
+        let cleared_bells = !self.belled_terminals.is_empty();
+        self.belled_terminals.clear();
+        if self.notifications.mark_all_items_read() || cleared_bells {
             self.update_dock_badge(ctx);
             ctx.emit(AgentManagementEvent::AllNotificationsMarkedRead);
+        }
+    }
+
+    /// Records that a terminal rang the bell while not viewed, so it counts toward
+    /// the Dock badge until it's viewed, its shell exits, or its pane closes.
+    pub(crate) fn record_terminal_bell(
+        &mut self,
+        terminal_view_id: EntityId,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if self.belled_terminals.insert(terminal_view_id) {
+            self.update_dock_badge(ctx);
+        }
+    }
+
+    /// Clears the unviewed-bell Dock badge state for a terminal.
+    pub(crate) fn clear_terminal_bell(
+        &mut self,
+        terminal_view_id: EntityId,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if self.belled_terminals.remove(&terminal_view_id) {
+            self.update_dock_badge(ctx);
         }
     }
 
@@ -85,6 +114,9 @@ impl AgentNotificationsModel {
         terminal_view_id: EntityId,
         ctx: &mut ModelContext<Self>,
     ) {
+        // Viewing a terminal always clears its unviewed-bell Dock badge entry,
+        // independent of the HOA notifications flag.
+        self.clear_terminal_bell(terminal_view_id, ctx);
         if !FeatureFlag::HOANotifications.is_enabled() {
             return;
         }
@@ -445,7 +477,11 @@ impl AgentNotificationsModel {
     }
 
     fn update_dock_badge(&self, ctx: &AppContext) {
-        ctx.set_dock_badge_count(self.notifications.dock_badge_count());
+        // The badge counts distinct terminals needing attention: unread local agent
+        // notifications plus terminals that rang the bell while unviewed.
+        let mut terminals = self.notifications.dock_badge_terminal_ids();
+        terminals.extend(self.belled_terminals.iter().copied());
+        ctx.set_dock_badge_count(terminals.len());
     }
 
     /// Drains and returns the pending artifacts for a conversation.

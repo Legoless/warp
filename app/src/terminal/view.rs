@@ -203,6 +203,7 @@ use super::warpify::WarpificationSource;
 use super::{cli_agent, CLIAgent, GridType};
 use crate::ai::agent::api::ServerConversationToken;
 use crate::ai::agent::conversation::{AIConversation, AIConversationId, ConversationStatus};
+use crate::ai::agent_management::AgentNotificationsModel;
 use crate::ai::agent::redaction::redact_secrets;
 use crate::ai::agent::todos::popup::{AgentTodosPopupEvent, AgentTodosPopupView};
 #[cfg(any(test, feature = "integration_tests"))]
@@ -11771,8 +11772,23 @@ impl TerminalView {
                 // TODO(vorporeal): Remove this once we have a visual bell
                 // indicator in terminal tabs.
                 ctx.request_user_attention();
+
+                // Count this terminal in the Dock badge when it bells while not
+                // viewed (focused in the active window); cleared when it's viewed,
+                // its shell exits, or its pane closes (GH-11095).
+                let is_viewed = ctx.is_self_or_child_focused()
+                    && ctx.windows().state().active_window == Some(ctx.window_id());
+                if !is_viewed {
+                    AgentNotificationsModel::handle(ctx).update(ctx, |model, ctx| {
+                        model.record_terminal_bell(self.view_id, ctx);
+                    });
+                }
             }
             ModelEvent::Exit { reason } => {
+                // A dead shell no longer needs bell attention in the Dock badge.
+                AgentNotificationsModel::handle(ctx).update(ctx, |model, ctx| {
+                    model.clear_terminal_bell(self.view_id, ctx);
+                });
                 if !self.manual_pty_shutdown_requested {
                     if let Some(conversation_id) = self.maybe_send_agent_exited_shell_telemetry(ctx)
                     {
