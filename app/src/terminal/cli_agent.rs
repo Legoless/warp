@@ -135,7 +135,16 @@ const MISTRAL_ORANGE: ColorU = ColorU {
     a: 255,
 };
 
-/// Represents a CLI agent (e.g., Claude Code, Gemini CLI, Codex, Amp, Droid, OpenCode, Copilot, Pi, Auggie, Cursor, Goose, Hermes, Mistral Vibe)
+/// Kimi Code brand color (white, monochrome logo per
+/// https://moonshotai.github.io/Branding-Guide/)
+const KIMI_COLOR: ColorU = ColorU {
+    r: 255,
+    g: 255,
+    b: 255,
+    a: 255,
+};
+
+/// Represents a CLI agent (e.g., Claude Code, Gemini CLI, Codex, Amp, Droid, OpenCode, Copilot, Pi, Auggie, Cursor, Goose, Hermes, Mistral Vibe, Kimi Code)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Sequence, Serialize, Deserialize)]
 pub enum CLIAgent {
     Claude,
@@ -152,6 +161,7 @@ pub enum CLIAgent {
     Hermes,
     Vibe,
     Antigravity,
+    Kimi,
     /// Represents an unknown/custom CLI agent matched by user-configured regex patterns.
     Unknown,
 }
@@ -174,6 +184,7 @@ impl CLIAgent {
             CLIAgent::Hermes => "hermes",
             CLIAgent::Vibe => "vibe",
             CLIAgent::Antigravity => "agy",
+            CLIAgent::Kimi => "kimi",
             CLIAgent::Unknown => "",
         }
     }
@@ -222,6 +233,7 @@ impl CLIAgent {
             CLIAgent::Hermes => "Hermes",
             CLIAgent::Vibe => "Mistral Vibe",
             CLIAgent::Antigravity => "Antigravity",
+            CLIAgent::Kimi => "Kimi Code",
             CLIAgent::Unknown => "CLI Agent",
         }
     }
@@ -246,6 +258,10 @@ impl CLIAgent {
             // up in a follow-up once an officially licensed SVG is available.
             CLIAgent::Vibe => None,
             CLIAgent::Antigravity => Some(Icon::AntigravityLogo),
+            // Kimi Code is recognized but ships without a brand asset; an
+            // `Icon::KimiLogo` can be wired up in a follow-up once an officially
+            // licensed SVG is available.
+            CLIAgent::Kimi => None,
             CLIAgent::Unknown => None,
         }
     }
@@ -277,6 +293,7 @@ impl CLIAgent {
             CLIAgent::Hermes => &[SkillProvider::Agents],
             CLIAgent::Vibe => &[SkillProvider::Agents],
             CLIAgent::Antigravity => &[],
+            CLIAgent::Kimi => &[SkillProvider::Agents],
             CLIAgent::Unknown => &[],
         }
     }
@@ -320,6 +337,7 @@ impl CLIAgent {
             CLIAgent::Hermes => Some(HERMES_PURPLE),
             CLIAgent::Vibe => Some(MISTRAL_ORANGE),
             CLIAgent::Antigravity => Some(ANTIGRAVITY_COLOR),
+            CLIAgent::Kimi => Some(KIMI_COLOR),
             CLIAgent::Unknown => None,
         }
     }
@@ -328,9 +346,11 @@ impl CLIAgent {
     /// Agents with light brand colors use a dark icon for contrast.
     pub fn brand_icon_color(&self) -> ColorU {
         match self {
-            CLIAgent::Pi | CLIAgent::Auggie | CLIAgent::Droid | CLIAgent::Antigravity => {
-                ColorU::new(0, 0, 0, 255)
-            }
+            CLIAgent::Pi
+            | CLIAgent::Auggie
+            | CLIAgent::Droid
+            | CLIAgent::Antigravity
+            | CLIAgent::Kimi => ColorU::new(0, 0, 0, 255),
             _ => ColorU::white(),
         }
     }
@@ -606,6 +626,7 @@ impl From<CLIAgent> for CLIAgentType {
             CLIAgent::Hermes => CLIAgentType::Hermes,
             CLIAgent::Vibe => CLIAgentType::Vibe,
             CLIAgent::Antigravity => CLIAgentType::Antigravity,
+            CLIAgent::Kimi => CLIAgentType::Kimi,
             CLIAgent::Unknown => CLIAgentType::Unknown,
         }
     }
