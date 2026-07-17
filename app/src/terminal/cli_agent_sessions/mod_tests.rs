@@ -697,3 +697,96 @@ fn permission_request_still_populates_summary_and_tool_fields() {
         CLIAgentSessionStatus::Blocked { .. },
     ));
 }
+
+/// Constructs an InProgress Claude session that already has a user prompt set,
+/// as if a `PromptSubmit` had started a turn that is still (per the tracked
+/// status) running. Used by the idle_prompt recovery tests below.
+fn in_progress_claude_session_with_prompt() -> CLIAgentSession {
+    CLIAgentSession {
+        agent: CLIAgent::Claude,
+        status: CLIAgentSessionStatus::InProgress,
+        session_context: CLIAgentSessionContext {
+            query: Some("fix the bug".to_owned()),
+            ..Default::default()
+        },
+        input_state: CLIAgentInputState::Closed,
+        should_auto_toggle_input: false,
+        listener: None,
+        plugin_version: None,
+        draft_text: None,
+        remote_host: None,
+        custom_command_prefix: None,
+        received_rich_notification: true,
+    }
+}
+
+fn idle_prompt_event() -> CLIAgentEvent {
+    CLIAgentEvent {
+        source: CLIAgentEventSource::RichPlugin,
+        v: 1,
+        agent: CLIAgent::Claude,
+        event: CLIAgentEventType::IdlePrompt,
+        session_id: Some("abc".to_owned()),
+        cwd: None,
+        project: None,
+        payload: CLIAgentEventPayload {
+            summary: Some("Claude is waiting for your input".to_owned()),
+            ..Default::default()
+        },
+    }
+}
+
+#[test]
+fn idle_prompt_clears_stuck_in_progress() {
+    // A rich Claude session has no path out of InProgress except a Stop event,
+    // and Stop notifications are best-effort. When a Stop is missed the pane
+    // latches at "working" forever; the idle_prompt the agent emits on
+    // returning to its shell prompt is the fallback that recovers it.
+    let mut session = in_progress_claude_session_with_prompt();
+
+    let changed = session.apply_event(&idle_prompt_event());
+
+    assert_eq!(changed, Some(CLIAgentSessionStatus::Success));
+    assert!(matches!(session.status, CLIAgentSessionStatus::Success));
+    // The idle_prompt summary must not leak into the title surface; the tab
+    // still falls back to the user's prompt.
+    assert_eq!(session.session_context.summary, None);
+    assert_eq!(
+        session.session_context.query.as_deref(),
+        Some("fix the bug")
+    );
+}
+
+#[test]
+fn idle_prompt_is_noop_after_stop_success() {
+    // The normal ordering is Stop (-> Success) then idle_prompt ~60s later.
+    // idle_prompt must not re-emit a status change or otherwise disturb a
+    // terminal Success.
+    let mut session = in_progress_claude_session_with_prompt();
+    session.status = CLIAgentSessionStatus::Success;
+
+    let changed = session.apply_event(&idle_prompt_event());
+
+    assert_eq!(changed, None);
+    assert!(matches!(session.status, CLIAgentSessionStatus::Success));
+}
+
+#[test]
+fn idle_prompt_does_not_override_blocked() {
+    // If the agent is Blocked awaiting a permission/question, an idle_prompt
+    // must not downgrade it to a not-working state or clear the permission
+    // summary that drives the attention UI.
+    let mut session = blocked_claude_session_with_permission_state();
+
+    let changed = session.apply_event(&idle_prompt_event());
+
+    assert_eq!(changed, None);
+    assert!(matches!(
+        session.status,
+        CLIAgentSessionStatus::Blocked { .. }
+    ));
+    assert_eq!(
+        session.session_context.summary.as_deref(),
+        Some("Wants to run bash: rm -rf /tmp")
+    );
+}
