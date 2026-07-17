@@ -55,13 +55,13 @@ use crate::pane_group::{
     CodePane, NotebookPane, PaneGroup, PaneId, TabBarHoverIndex, TerminalPane, WorkflowPane,
 };
 use crate::safe_triangle::SafeTriangle;
+use crate::settings::PaneSettings;
 use crate::tab::{tab_position_id, SelectedTabColor, TabData};
 use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
 use crate::terminal::session_settings::SessionSettings;
 use crate::terminal::view::TerminalViewState;
 use crate::terminal::{CLIAgent, TerminalView};
 use crate::themes::theme::Fill as ThemeFill;
-use crate::ui_components::agent_icon::terminal_view_agent_icon_variant;
 use crate::ui_components::buttons::combo_inner_button;
 use crate::ui_components::icon_with_status::{render_icon_with_status, IconWithStatusVariant};
 use crate::ui_components::icons::Icon as UiIcon;
@@ -1052,29 +1052,14 @@ fn normalize_summary_text(text: &str) -> Option<String> {
     (!normalized.is_empty()).then_some(normalized)
 }
 
-/// Returns the conversation status for a terminal pane, used to render the per-line status
-/// pill prefix in Summary mode. Mirrors the status sources used by `render_detail_status_pill`
-/// in the detail sidecar — CLI agent sessions with rich status, Oz agent conversations, or
-/// ambient agent sessions. Returns `None` for plain terminals or conversations without status.
+/// Returns the activity status for a terminal pane, used to render the per-line status
+/// pill prefix in Summary mode. This routes through the same TerminalView chrome resolver
+/// used by pane Activity colors so tabs and pane chrome do not drift.
 fn summary_conversation_status_for_terminal(
     terminal_view: &TerminalView,
     app: &AppContext,
 ) -> Option<ConversationStatus> {
-    let cli_agent_session = CLIAgentSessionsModel::as_ref(app).session(terminal_view.id());
-    if let Some(session) = cli_agent_session
-        .filter(|s| s.supports_rich_status())
-        .filter(|s| !matches!(s.agent, CLIAgent::Unknown))
-    {
-        return Some(session.status.to_conversation_status());
-    }
-
-    let is_ambient = terminal_view.is_ambient_agent_session(app);
-    let has_conversation = terminal_view
-        .selected_conversation_display_title(app)
-        .is_some();
-    (has_conversation || is_ambient)
-        .then(|| terminal_view.selected_conversation_status_for_display(app))
-        .flatten()
+    terminal_view.activity_status_for_chrome(app)
 }
 
 fn coalesce_summary_branch_entries(
@@ -3307,7 +3292,7 @@ fn resolve_icon_with_status_variant(
         TypedPane::Terminal(terminal_pane) => {
             let terminal_view = terminal_pane.terminal_view(app);
             let terminal_view = terminal_view.as_ref(app);
-            if let Some(variant) = terminal_view_agent_icon_variant(terminal_view, app) {
+            if let Some(variant) = terminal_view.agent_icon_variant_for_chrome(app) {
                 variant
             } else {
                 // Plain terminal: use foreground color per design spec
@@ -3512,7 +3497,7 @@ impl TypedPane<'_> {
                 let terminal_view = terminal_view.as_ref(app);
                 // Route through the shared helper so summary mode agrees with
                 // `resolve_icon_with_status_variant` on what the tab represents.
-                match terminal_view_agent_icon_variant(terminal_view, app) {
+                match terminal_view.agent_icon_variant_for_chrome(app) {
                     Some(IconWithStatusVariant::OzAgent { is_ambient, .. }) => {
                         SummaryPaneKind::OzAgent { is_ambient }
                     }
@@ -4236,8 +4221,8 @@ impl PaneGroup {
 /// Returns the [`SummaryPaneKind`] representing how the given pane should
 /// be rendered visually, matching the treatment used by vertical tabs
 /// Summary mode. For Terminal panes, distinguishes Oz vs Oz cloud vs each
-/// known CLI agent (Claude, Codex, …) by routing through
-/// `terminal_view_agent_icon_variant`; for other pane types it falls back
+/// known CLI agent (Claude, Codex, ...) by routing through
+/// `TerminalView::agent_icon_variant_for_chrome`; for other pane types it falls back
 /// to `TypedPane::summary_pane_kind`. Returns `None` when `pane_id` does
 /// not resolve to a pane in `pane_group` so callers can skip stale ids
 /// via `filter_map`; note this is distinct from a known pane that
@@ -5503,11 +5488,22 @@ fn render_pull_request_badge_content(label: &str, appearance: &Appearance) -> Bo
         .finish()
 }
 
+/// Resolves a terminal pane's tab-row color source: an explicit directory color
+/// always wins; the opt-in activity tint only fills panes without one, so it
+/// never overrides user-chosen colors.
+fn terminal_pane_tab_color(
+    dir_color: Option<AnsiColorIdentifier>,
+    tab_activity_background: bool,
+    activity_color: impl FnOnce() -> Option<AnsiColorIdentifier>,
+) -> Option<AnsiColorIdentifier> {
+    dir_color.or_else(|| tab_activity_background.then(activity_color).flatten())
+}
+
 /// Resolves the rendered color mode for a tab's panes from the tab's own color,
 /// whether or not it's in a group: a manual `selected_color` override applies to
-/// the whole tab, otherwise it falls through to per-pane directory colors. A
-/// group's color tints the group container separately and does not override its
-/// members.
+/// the whole tab, otherwise it falls through to per-pane directory colors (with
+/// the opt-in activity tint filling uncolored terminal panes). A group's color
+/// tints the group container separately and does not override its members.
 fn compute_tab_group_color_mode(
     tab: &TabData,
     pane_group: &PaneGroup,
@@ -5529,18 +5525,23 @@ fn compute_tab_group_color_mode(
         .directory_tab_colors
         .value()
         .clone();
+    let tab_activity_background = *PaneSettings::as_ref(app).tab_activity_background;
     let per_pane: HashMap<PaneId, Option<AnsiColorIdentifier>> = visible_pane_ids
         .iter()
         .map(|&pane_id| {
             let color = if let Some(tv) = pane_group.terminal_view_from_pane_id(pane_id, app) {
+                let terminal_view = tv.as_ref(app);
                 // Terminal pane: determine color from CWD.
-                tv.as_ref(app)
+                let dir_color = terminal_view
                     .canonical_session_pwd_if_local(app)
                     .and_then(|cwd| {
                         dir_colors
                             .color_for_directory(cwd.as_path())
                             .and_then(|c| c.ansi_color())
-                    })
+                    });
+                terminal_pane_tab_color(dir_color, tab_activity_background, || {
+                    terminal_view.activity_color_identifier_for_chrome(app)
+                })
             } else if let Some(code_view) = pane_group.code_view_from_pane_id(pane_id, app) {
                 // Code pane: determine color from the open file path using longest-prefix
                 // matching against configured directories, so e.g. warp-internal/code.rs
@@ -6697,18 +6698,11 @@ fn render_terminal_detail_section(
     let text_colors = detail_sidecar_text_colors(theme);
     let working_directory = resolved_terminal_working_directory(terminal_view, app);
     let git_branch = terminal_view.current_git_branch(app);
-    let cli_agent_session = CLIAgentSessionsModel::as_ref(app).session(terminal_view.id());
     let agent_text = terminal_agent_text(terminal_view, app);
     let (conversation_display_title, cli_agent_title) =
         preferred_agent_tab_titles(&agent_text, agent_tab_text_preference(app));
     let kind_label = terminal_kind_badge_label(agent_text.is_oz_agent, agent_text.cli_agent);
-    let status = if let Some(session) = cli_agent_session.filter(|s| s.supports_rich_status()) {
-        Some(session.status.to_conversation_status())
-    } else if agent_text.is_oz_agent {
-        terminal_view.selected_conversation_status_for_display(app)
-    } else {
-        None
-    };
+    let status = terminal_view.activity_status_for_chrome(app);
 
     let title_text = terminal_view.terminal_title_from_shell();
     let primary_line = terminal_primary_line_data(

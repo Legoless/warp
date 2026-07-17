@@ -1,7 +1,9 @@
 //! This module contains the implementation of `BackingView` for `TerminalView`, as well as
 //! business logic for integrating the terminal view with the pane infra (`crate::pane_group`).
+use pathfinder_color::ColorU;
 use settings::Setting as _;
 use warp_core::context_flag::ContextFlag;
+use warp_core::ui::theme::AnsiColorIdentifier;
 use warpui::elements::{
     ConstrainedBox, CrossAxisAlignment, Empty, Flex, MainAxisAlignment, MainAxisSize,
     ParentElement, Shrinkable,
@@ -41,14 +43,19 @@ use crate::pane_group::{BackingView, SplitPaneState, TOGGLE_MAXIMIZE_PANE_BINDIN
 use crate::settings::app_installation_detection::{
     UserAppInstallDetectionSettings, UserAppInstallStatus,
 };
+use crate::settings::{PaneColorMode, PaneSettings};
+use crate::terminal::activity_status::{
+    pane_activity_state_for_status, terminal_activity_status_from_inputs,
+    TerminalActivityStatusInputs,
+};
 use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
 use crate::terminal::shared_session::participant_avatar_view::render_participants_and_role_elements;
 use crate::terminal::shared_session::render_util::shared_session_indicator_color;
 use crate::terminal::shared_session::SharedSessionActionSource;
-use crate::terminal::{TerminalManager, TerminalView};
+use crate::terminal::{CLIAgent, TerminalManager, TerminalView};
 use crate::ui_components::agent_icon::terminal_view_agent_icon_variant;
 use crate::ui_components::buttons::icon_button_with_color;
-use crate::ui_components::icon_with_status::render_icon_with_status;
+use crate::ui_components::icon_with_status::{render_icon_with_status, IconWithStatusVariant};
 use crate::ui_components::{blended_colors, icons};
 use crate::util::bindings::keybinding_name_to_display_string;
 use crate::workspace::tab_settings::TabSettings;
@@ -119,38 +126,208 @@ impl TerminalView {
         let is_ambient_agent = self.is_ambient_agent_session(ctx);
         let selected_conversation_title = self.selected_conversation_display_title(ctx);
         let selected_cli_agent_title = self.selected_cli_agent_title_for_chrome(ctx);
+        let (is_alt_screen_active, has_cli_agent_command) = {
+            let model = self.model.lock();
+            (
+                model.is_alt_screen_active(),
+                self.block_list_has_cli_agent_command(&model, ctx),
+            )
+        };
+        let has_cli_agent_session = CLIAgentSessionsModel::as_ref(ctx)
+            .session(self.view_id)
+            .is_some();
+        let preserve_activity_content_colors = should_preserve_activity_content_colors(
+            PaneSettings::as_ref(ctx).pane_color_mode == PaneColorMode::Activity,
+            is_alt_screen_active,
+            has_cli_agent_session || has_cli_agent_command,
+        );
 
         // Prefer CLI agent session text before the terminal title,
         // matching the vertical-tab behavior in terminal_primary_line_data().
-        let new_pane_title = if let Some(cli_agent_title) = selected_cli_agent_title {
-            self.is_using_conversation_for_pane_header_title = false;
-            cli_agent_title
-        } else if self.is_long_running_and_user_controlled() && !self.terminal_title.is_empty() {
-            self.is_using_conversation_for_pane_header_title = false;
-            self.terminal_title.clone()
-        } else {
-            match selected_conversation_title {
-                Some(conversation_title) => {
-                    self.is_using_conversation_for_pane_header_title = true;
-                    conversation_title
-                }
-                None => {
-                    if is_ambient_agent {
-                        default_agent_conversation_title(is_ambient_agent)
-                    } else {
-                        self.terminal_title.clone()
+        let (new_pane_title, is_using_conversation_for_pane_header_title) =
+            if let Some(cli_agent_title) = selected_cli_agent_title {
+                (cli_agent_title, false)
+            } else if self.is_long_running_and_user_controlled() && !self.terminal_title.is_empty()
+            {
+                (self.terminal_title.clone(), false)
+            } else {
+                match selected_conversation_title {
+                    Some(conversation_title) => (conversation_title, true),
+                    None => {
+                        if is_ambient_agent {
+                            (default_agent_conversation_title(is_ambient_agent), false)
+                        } else {
+                            (self.terminal_title.clone(), false)
+                        }
                     }
                 }
-            }
-        };
+            };
+        self.is_using_conversation_for_pane_header_title =
+            is_using_conversation_for_pane_header_title;
+        let activity_color = self.pane_activity_color(ctx);
+
         self.pane_configuration.update(ctx, |pane_config, ctx| {
             pane_config.set_title(new_pane_title, ctx);
+            pane_config.set_activity_color(activity_color, ctx);
+            pane_config.set_preserve_content_colors(preserve_activity_content_colors, ctx);
             if FeatureFlag::AgentView.is_enabled() {
                 pane_config.refresh_pane_header_overflow_menu_items(ctx);
             }
             pane_config.notify_header_content_changed(ctx);
         });
         self.update_agent_view_pane_header(ctx);
+    }
+
+    fn pane_activity_color(&self, ctx: &ViewContext<Self>) -> Option<ColorU> {
+        let activity_color = self.activity_color_identifier_for_chrome(ctx)?;
+        Some(
+            activity_color
+                .to_ansi_color(&Appearance::as_ref(ctx).theme().terminal_colors().normal)
+                .into(),
+        )
+    }
+
+    /// Resolves the activity color identifier for this terminal's chrome. Shared by
+    /// the pane surfaces (header/background) and vertical tab rows so they cannot
+    /// drift on which color a status maps to. `None` when pane coloring is off.
+    pub(crate) fn activity_color_identifier_for_chrome(
+        &self,
+        ctx: &AppContext,
+    ) -> Option<AnsiColorIdentifier> {
+        let pane_settings = PaneSettings::as_ref(ctx);
+        if pane_settings.pane_color_mode != PaneColorMode::Activity {
+            return None;
+        }
+
+        let activity_status = if self.codex_activity_color_follows_pane_title_indicator(ctx) {
+            self.pane_title_activity_status_for_chrome(ctx)
+        } else {
+            self.activity_status_for_chrome(ctx)
+        };
+        let activity_state = pane_activity_state_for_status(activity_status.as_ref());
+        Some(
+            pane_settings
+                .pane_activity_colors
+                .value()
+                .color_for(activity_state),
+        )
+    }
+
+    pub(crate) fn activity_status_for_chrome(
+        &self,
+        ctx: &AppContext,
+    ) -> Option<ConversationStatus> {
+        let agent_icon_variant = terminal_view_agent_icon_variant(self, ctx);
+        let agent_icon_status =
+            activity_status_from_agent_icon_variant(agent_icon_variant.as_ref());
+        self.activity_status_for_chrome_with_agent_icon_status(ctx, agent_icon_status)
+    }
+
+    fn activity_status_for_chrome_with_agent_icon_status(
+        &self,
+        ctx: &AppContext,
+        agent_icon_status: Option<ConversationStatus>,
+    ) -> Option<ConversationStatus> {
+        let (has_active_cli_agent_command, millis_since_last_output) = {
+            let model = self.model.lock();
+            let has_active_cli_agent_command = self.active_block_has_cli_agent_command(&model, ctx);
+            (
+                has_active_cli_agent_command,
+                model.millis_since_last_output(),
+            )
+        };
+
+        terminal_activity_status_from_inputs(TerminalActivityStatusInputs {
+            cli_session: CLIAgentSessionsModel::as_ref(ctx).session(self.view_id),
+            has_terminal_conversation: self.selected_conversation_display_title(ctx).is_some(),
+            is_ambient: self.is_ambient_agent_session(ctx),
+            selected_conversation_status: self.selected_conversation_status_for_display(ctx),
+            has_active_cli_agent_command,
+            millis_since_last_output,
+            has_active_conversation: BlocklistAIHistoryModel::as_ref(ctx)
+                .active_conversation(self.view_id)
+                .is_some(),
+            is_long_running: self.is_long_running(),
+            agent_icon_status,
+        })
+    }
+
+    fn codex_activity_color_follows_pane_title_indicator(&self, ctx: &AppContext) -> bool {
+        if CLIAgentSessionsModel::as_ref(ctx)
+            .session(self.view_id)
+            .is_some_and(|session| session.agent == CLIAgent::Codex)
+        {
+            return true;
+        }
+
+        let model = self.model.lock();
+        self.detect_cli_agent_from_model(&model, ctx)
+            .is_some_and(|(agent, _)| agent == CLIAgent::Codex)
+    }
+
+    fn should_render_ambient_agent_indicator_in_pane_title(&self, ctx: &AppContext) -> bool {
+        self.ambient_agent_task_id_for_details_panel(ctx).is_some()
+            || self.model.lock().is_shared_ambient_agent_session()
+    }
+
+    fn should_render_cli_agent_indicator_in_pane_title(&self, ctx: &AppContext) -> bool {
+        CLIAgentSessionsModel::as_ref(ctx)
+            .session(self.view_id)
+            .is_some_and(|session| !matches!(session.agent, CLIAgent::Unknown))
+    }
+
+    fn should_render_agent_activity_indicator_in_pane_title(&self, ctx: &AppContext) -> bool {
+        self.should_render_ambient_agent_indicator_in_pane_title(ctx)
+            || self.should_render_cli_agent_indicator_in_pane_title(ctx)
+            || self.is_using_conversation_for_pane_header_title
+            || (self.is_long_running()
+                && self
+                    .ai_context_model
+                    .as_ref(ctx)
+                    .selected_conversation(ctx)
+                    .is_some())
+    }
+
+    pub(crate) fn pane_title_activity_status_for_chrome(
+        &self,
+        ctx: &AppContext,
+    ) -> Option<ConversationStatus> {
+        let agent_icon_variant = terminal_view_agent_icon_variant(self, ctx)?;
+        let agent_icon_status = activity_status_from_agent_icon_variant(Some(&agent_icon_variant));
+        self.pane_title_activity_status_with_agent_icon_status(ctx, agent_icon_status)
+    }
+
+    fn pane_title_activity_status_with_agent_icon_status(
+        &self,
+        ctx: &AppContext,
+        agent_icon_status: Option<ConversationStatus>,
+    ) -> Option<ConversationStatus> {
+        if !self.should_render_agent_activity_indicator_in_pane_title(ctx) {
+            return None;
+        }
+
+        self.activity_status_for_chrome_with_agent_icon_status(ctx, agent_icon_status)
+    }
+
+    fn agent_icon_variant_for_pane_title(&self, ctx: &AppContext) -> Option<IconWithStatusVariant> {
+        let variant = terminal_view_agent_icon_variant(self, ctx)?;
+        let agent_icon_status = activity_status_from_agent_icon_variant(Some(&variant));
+        Some(agent_icon_variant_with_activity_status(
+            variant,
+            self.pane_title_activity_status_with_agent_icon_status(ctx, agent_icon_status),
+        ))
+    }
+
+    pub(crate) fn agent_icon_variant_for_chrome(
+        &self,
+        ctx: &AppContext,
+    ) -> Option<IconWithStatusVariant> {
+        let variant = terminal_view_agent_icon_variant(self, ctx)?;
+        let agent_icon_status = activity_status_from_agent_icon_variant(Some(&variant));
+        Some(agent_icon_variant_with_activity_status(
+            variant,
+            self.activity_status_for_chrome_with_agent_icon_status(ctx, agent_icon_status),
+        ))
     }
 
     /// Returns the shareable object for the active agent view conversation, if any.
@@ -290,7 +467,8 @@ impl TerminalView {
             ClipConfig::start()
         };
 
-        let should_render_ambient_agent_indicator = self.is_cloud_agent_session(app);
+        let should_render_ambient_agent_indicator =
+            self.should_render_ambient_agent_indicator_in_pane_title(app);
         let theme = appearance.theme();
         let render_agent_circle = |variant| {
             render_icon_with_status(
@@ -304,7 +482,8 @@ impl TerminalView {
         let pane_indicator = if should_render_ambient_agent_indicator {
             // Shared/viewed ambient session: route through the shared helper so the pane header
             // renders the same brand-color circle + cloud lobe + status as the vertical tab.
-            terminal_view_agent_icon_variant(self, app).map(render_agent_circle)
+            self.agent_icon_variant_for_pane_title(app)
+                .map(render_agent_circle)
         } else if let Some(shared_session) = self.shared_session.as_ref() {
             if let Some(Viewer {
                 sharer: Some(sharer),
@@ -328,17 +507,11 @@ impl TerminalView {
                     .finish(),
                 )
             }
-        } else if self.is_using_conversation_for_pane_header_title
-            || (self.is_long_running()
-                && self
-                    .ai_context_model
-                    .as_ref(app)
-                    .selected_conversation(app)
-                    .is_some())
-        {
+        } else if self.should_render_agent_activity_indicator_in_pane_title(app) {
             // Conversation-bound terminal: same shared helper — produces an OzAgent variant for
             // local conversations and a CLIAgent variant for the (rare) CLI-backed terminal.
-            terminal_view_agent_icon_variant(self, app).map(render_agent_circle)
+            self.agent_icon_variant_for_pane_title(app)
+                .map(render_agent_circle)
         } else {
             self.render_terminal_mode_indicator(app)
         };
@@ -1101,3 +1274,63 @@ fn default_agent_conversation_title(is_ambient_agent: bool) -> String {
         "New agent conversation".to_owned()
     }
 }
+
+fn activity_status_from_agent_icon_variant(
+    variant: Option<&IconWithStatusVariant>,
+) -> Option<ConversationStatus> {
+    match variant? {
+        IconWithStatusVariant::OzAgent { status, .. }
+        | IconWithStatusVariant::CLIAgent { status, .. }
+        | IconWithStatusVariant::CustomAvatar { status, .. } => status.clone(),
+        IconWithStatusVariant::Neutral { .. } | IconWithStatusVariant::NeutralElement { .. } => {
+            None
+        }
+    }
+}
+
+fn agent_icon_variant_with_activity_status(
+    variant: IconWithStatusVariant,
+    activity_status: Option<ConversationStatus>,
+) -> IconWithStatusVariant {
+    match variant {
+        IconWithStatusVariant::OzAgent { is_ambient, .. } => IconWithStatusVariant::OzAgent {
+            status: activity_status,
+            is_ambient,
+        },
+        IconWithStatusVariant::CLIAgent {
+            agent, is_ambient, ..
+        } => IconWithStatusVariant::CLIAgent {
+            agent,
+            status: activity_status,
+            is_ambient,
+        },
+        IconWithStatusVariant::CustomAvatar {
+            avatar, is_ambient, ..
+        } => IconWithStatusVariant::CustomAvatar {
+            avatar,
+            status: activity_status,
+            is_ambient,
+        },
+        IconWithStatusVariant::Neutral { icon, icon_color } => {
+            IconWithStatusVariant::Neutral { icon, icon_color }
+        }
+        IconWithStatusVariant::NeutralElement { icon_element } => {
+            IconWithStatusVariant::NeutralElement { icon_element }
+        }
+    }
+}
+
+/// Preserve terminal-drawn colors for TUIs by avoiding foreground overlays and
+/// terminal color rewrites. The pane background may still show through
+/// transparent default-background cells.
+fn should_preserve_activity_content_colors(
+    is_activity_mode: bool,
+    is_alt_screen_active: bool,
+    has_cli_agent_session: bool,
+) -> bool {
+    is_activity_mode && (is_alt_screen_active || has_cli_agent_session)
+}
+
+#[cfg(test)]
+#[path = "pane_impl_tests.rs"]
+mod tests;

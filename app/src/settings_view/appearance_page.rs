@@ -7,6 +7,7 @@ use std::rc::Rc;
 use ::settings::{Setting, SettingSection, ToggleableSetting};
 use enum_iterator::all;
 use warp_core::ui::theme::color::internal_colors;
+use warp_core::ui::theme::AnsiColorIdentifier;
 use warp_errors::{report_error, report_if_error};
 use warp_util::path::user_friendly_path;
 use warpui::elements::{
@@ -63,7 +64,9 @@ use crate::settings::{
     CodeSettings, CursorBlink, CursorBlinkEnabled, CursorDisplayType, EnforceMinimumContrast,
     FocusPaneOnHover, FontSettings, FontSettingsChangedEvent, GPUSettings, InputBoxType,
     InputModeSettings, InputModeState, InputSettings, InputSettingsChangedEvent, MonospaceFontName,
-    PaneSettings, ShouldDimInactivePanes, ThemeSettings, UseSystemTheme, UseThinStrokes,
+    PaneActivityBackground, PaneActivityColors, PaneActivityState, PaneColorMode, PaneSettings,
+    PaneSettingsChangedEvent, ShouldDimInactivePanes, TabActivityBackground, ThemeSettings,
+    UseSystemTheme, UseThinStrokes,
     DEFAULT_MONOSPACE_FONT_NAME,
 };
 use crate::terminal::block_list_viewport::InputMode;
@@ -113,6 +116,16 @@ const MIN_LINE_SPACING: f32 = 0.1;
 const MAX_LINE_SPACING: f32 = 5.;
 
 const INPUT_MODE_DROPDOWN_WIDTH: f32 = 225.;
+const PANE_ACTIVITY_COLOR_OPTIONS: [AnsiColorIdentifier; 8] = [
+    AnsiColorIdentifier::Black,
+    AnsiColorIdentifier::Red,
+    AnsiColorIdentifier::Green,
+    AnsiColorIdentifier::Yellow,
+    AnsiColorIdentifier::Blue,
+    AnsiColorIdentifier::Magenta,
+    AnsiColorIdentifier::Cyan,
+    AnsiColorIdentifier::White,
+];
 
 // Max and min sizes for new window creation in terms of rows and cols
 const MIN_NEW_WINDOW_ROWS_OR_COLS: u16 = 5;
@@ -534,6 +547,13 @@ pub enum AppearancePageAction {
     SetEnforceMinimumContrast(EnforceMinimumContrast),
     OpenUrl(String),
     ToggleFocusPaneOnHover,
+    SetPaneColorMode(PaneColorMode),
+    TogglePaneActivityBackground,
+    ToggleTabActivityBackground,
+    SetPaneActivityColor {
+        activity: PaneActivityState,
+        color: AnsiColorIdentifier,
+    },
     ToggleInputMode,
     ToggleAltScreenPadding,
     UpdateAltScreenPaddingMode(AltScreenPaddingMode),
@@ -572,6 +592,7 @@ pub struct AppearanceSettingsPageView {
     input_type_radio_state: RadioButtonStateHandle,
     app_icon_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
     workspace_decorations_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
+    pane_color_mode_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
     tab_close_button_position_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
     zoom_level_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
     zoom_reset_button_mouse_state: MouseStateHandle,
@@ -579,6 +600,7 @@ pub struct AppearanceSettingsPageView {
     view_font_type: FontType,
     alt_screen_padding_editor: ViewHandle<EditorView>,
     color_picker_dot_states: Vec<Vec<MouseStateHandle>>,
+    pane_activity_color_dot_states: [Vec<MouseStateHandle>; PaneActivityState::COUNT],
     directory_tab_color_delete_buttons: Vec<ViewHandle<ActionButton>>,
     header_toolbar_inline_editor: ViewHandle<HeaderToolbarInlineEditor>,
 
@@ -721,6 +743,38 @@ impl TypedActionView for AppearanceSettingsPageView {
                             report_error!(e);
                         }
                     }
+                });
+                ctx.notify();
+            }
+            SetPaneColorMode(mode) => {
+                PaneSettings::handle(ctx).update(ctx, |pane_settings, ctx| {
+                    report_if_error!(pane_settings.pane_color_mode.set_value(*mode, ctx));
+                });
+                ctx.notify();
+            }
+            TogglePaneActivityBackground => {
+                PaneSettings::handle(ctx).update(ctx, |pane_settings, ctx| {
+                    report_if_error!(pane_settings
+                        .pane_activity_background
+                        .toggle_and_save_value(ctx));
+                });
+                ctx.notify();
+            }
+            ToggleTabActivityBackground => {
+                PaneSettings::handle(ctx).update(ctx, |pane_settings, ctx| {
+                    report_if_error!(pane_settings
+                        .tab_activity_background
+                        .toggle_and_save_value(ctx));
+                });
+                ctx.notify();
+            }
+            SetPaneActivityColor { activity, color } => {
+                PaneSettings::handle(ctx).update(ctx, |pane_settings, ctx| {
+                    let new_value = pane_settings
+                        .pane_activity_colors
+                        .value()
+                        .with_color(*activity, *color);
+                    report_if_error!(pane_settings.pane_activity_colors.set_value(new_value, ctx));
                 });
                 ctx.notify();
             }
@@ -887,7 +941,14 @@ impl AppearanceSettingsPageView {
         let appearance_handle = Appearance::handle(ctx);
         ctx.subscribe_to_model(&appearance_handle, Self::handle_appearance_update);
 
-        ctx.subscribe_to_model(&PaneSettings::handle(ctx), |_, _, _, ctx| {
+        ctx.subscribe_to_model(&PaneSettings::handle(ctx), |me, _, event, ctx| {
+            if let PaneSettingsChangedEvent::PaneColorMode { .. } = event {
+                let mode = PaneSettings::as_ref(ctx).pane_color_mode;
+                me.pane_color_mode_dropdown.update(ctx, |dropdown, ctx| {
+                    dropdown
+                        .set_selected_by_action(AppearancePageAction::SetPaneColorMode(mode), ctx);
+                });
+            }
             ctx.notify();
         });
 
@@ -1338,6 +1399,7 @@ impl AppearanceSettingsPageView {
             workspace_decorations_dropdown: Self::build_workspace_decoration_visibility_dropdown(
                 ctx,
             ),
+            pane_color_mode_dropdown: Self::build_pane_color_mode_dropdown(ctx),
             tab_close_button_position_dropdown: Self::build_tab_close_button_position_dropdown(ctx),
             zoom_level_dropdown: Self::build_zoom_level_dropdown(ctx),
             zoom_reset_button_mouse_state: MouseStateHandle::default(),
@@ -1350,6 +1412,11 @@ impl AppearanceSettingsPageView {
                         .collect()
                 })
                 .collect(),
+            pane_activity_color_dot_states: std::array::from_fn(|_| {
+                (0..PANE_ACTIVITY_COLOR_OPTIONS.len())
+                    .map(|_| MouseStateHandle::default())
+                    .collect()
+            }),
             directory_tab_color_delete_buttons: build_directory_delete_buttons(ctx),
             header_toolbar_inline_editor,
             alt_screen_padding_editor,
@@ -1454,6 +1521,7 @@ impl AppearanceSettingsPageView {
         categories.push(Category::new(
             "Panes",
             vec![
+                Box::new(PaneColorModeWidget::default()),
                 Box::new(DimInactivePanesWidget::default()),
                 Box::new(FocusFollowsMouseWidget::default()),
             ],
@@ -2563,6 +2631,34 @@ impl AppearanceSettingsPageView {
                 DropdownItem::new(Self::workspace_decoration_visibility_dropdown_item_label(value), AppearancePageAction::SetWorkspaceDecorationVisibility(value))
             }).collect(), ctx);
             dropdown.set_selected_by_index(selected_index, ctx);
+
+            dropdown
+        })
+    }
+
+    fn build_pane_color_mode_dropdown(
+        ctx: &mut ViewContext<Self>,
+    ) -> ViewHandle<Dropdown<AppearancePageAction>> {
+        ctx.add_typed_action_view(|ctx| {
+            let mut dropdown = Dropdown::new(ctx);
+
+            let values = [PaneColorMode::Off, PaneColorMode::Activity];
+            dropdown.set_items(
+                values
+                    .into_iter()
+                    .map(|value| {
+                        DropdownItem::new(
+                            value.display_name(),
+                            AppearancePageAction::SetPaneColorMode(value),
+                        )
+                    })
+                    .collect(),
+                ctx,
+            );
+
+            let current_value = PaneSettings::as_ref(ctx).pane_color_mode;
+            dropdown
+                .set_selected_by_action(AppearancePageAction::SetPaneColorMode(current_value), ctx);
 
             dropdown
         })
@@ -3850,6 +3946,190 @@ impl SettingsWidget for PromptWidget {
         })
         .finish()
     }
+}
+
+#[derive(Default)]
+struct PaneColorModeWidget {
+    activity_background_switch_state: SwitchStateHandle,
+    tab_activity_background_switch_state: SwitchStateHandle,
+}
+
+impl SettingsWidget for PaneColorModeWidget {
+    type View = AppearanceSettingsPageView;
+
+    fn search_terms(&self) -> &str {
+        "pane color mode activity agent working needs help requires attention background"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let pane_settings = PaneSettings::as_ref(app);
+        let dropdown = render_dropdown_item(
+            appearance,
+            "Pane Color mode",
+            None,
+            None,
+            LocalOnlyIconState::for_setting(
+                PaneColorMode::storage_key(),
+                PaneColorMode::sync_to_cloud(),
+                &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                app,
+            ),
+            None,
+            &view.pane_color_mode_dropdown,
+        );
+
+        let mut content = Flex::column().with_child(dropdown);
+        if pane_settings.pane_color_mode == PaneColorMode::Activity {
+            let activity_background_toggle = render_body_item::<AppearancePageAction>(
+                "Color pane background".into(),
+                None,
+                LocalOnlyIconState::for_setting(
+                    PaneActivityBackground::storage_key(),
+                    PaneActivityBackground::sync_to_cloud(),
+                    &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                    app,
+                ),
+                ToggleState::Enabled,
+                appearance,
+                appearance
+                    .ui_builder()
+                    .switch(self.activity_background_switch_state.clone())
+                    .check(*pane_settings.pane_activity_background)
+                    .build()
+                    .on_click(move |ctx, _, _| {
+                        ctx.dispatch_typed_action(
+                            AppearancePageAction::TogglePaneActivityBackground,
+                        );
+                    })
+                    .finish(),
+                Some("Apply activity colors behind pane content.".into()),
+            );
+
+            let tab_activity_background_toggle = render_body_item::<AppearancePageAction>(
+                "Color tab background".into(),
+                None,
+                LocalOnlyIconState::for_setting(
+                    TabActivityBackground::storage_key(),
+                    TabActivityBackground::sync_to_cloud(),
+                    &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                    app,
+                ),
+                ToggleState::Enabled,
+                appearance,
+                appearance
+                    .ui_builder()
+                    .switch(self.tab_activity_background_switch_state.clone())
+                    .check(*pane_settings.tab_activity_background)
+                    .build()
+                    .on_click(move |ctx, _, _| {
+                        ctx.dispatch_typed_action(
+                            AppearancePageAction::ToggleTabActivityBackground,
+                        );
+                    })
+                    .finish(),
+                Some(
+                    "Apply activity colors to vertical tab rows without a custom tab color."
+                        .into(),
+                ),
+            );
+
+            let mut rows = Flex::column().with_spacing(8.);
+            let colors = pane_settings.pane_activity_colors.value();
+            for activity in PaneActivityState::ALL {
+                let mouse_states = &view.pane_activity_color_dot_states[activity.index()];
+                rows.add_child(render_pane_activity_color_row(
+                    activity,
+                    colors,
+                    mouse_states,
+                    appearance,
+                ));
+            }
+            let activity_settings = Flex::column()
+                .with_child(activity_background_toggle)
+                .with_child(tab_activity_background_toggle)
+                .with_child(
+                    Container::new(rows.finish())
+                        .with_padding_bottom(HEADER_PADDING)
+                        .finish(),
+                )
+                .finish();
+            content.add_child(
+                Container::new(activity_settings)
+                    .with_margin_top(8.)
+                    .finish(),
+            );
+        }
+
+        content.finish()
+    }
+}
+
+fn render_pane_activity_color_row(
+    activity: PaneActivityState,
+    colors: &PaneActivityColors,
+    mouse_states: &[MouseStateHandle],
+    appearance: &Appearance,
+) -> Box<dyn Element> {
+    let theme = appearance.theme();
+    let current_color = colors.color_for(activity);
+    let label = Shrinkable::new(
+        1.,
+        Text::new(
+            activity.display_name(),
+            appearance.ui_font_family(),
+            appearance.ui_font_size(),
+        )
+        .with_color(theme.nonactive_ui_text_color().into())
+        .finish(),
+    )
+    .finish();
+
+    let mut dots_row = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
+    for (ansi_id, mouse_state) in PANE_ACTIVITY_COLOR_OPTIONS
+        .iter()
+        .copied()
+        .zip(mouse_states.iter().cloned())
+    {
+        let dot_color = ansi_id
+            .to_ansi_color(&theme.terminal_colors().normal)
+            .into();
+        let is_selected = current_color == ansi_id;
+
+        dots_row.add_child(
+            render_color_dot(
+                mouse_state,
+                dot_color,
+                is_selected,
+                theme.accent().into(),
+                false,
+                theme.foreground(),
+                ansi_id.to_string(),
+                appearance,
+            )
+            .on_click(move |ctx, _, _| {
+                if !is_selected {
+                    ctx.dispatch_typed_action(AppearancePageAction::SetPaneActivityColor {
+                        activity,
+                        color: ansi_id,
+                    });
+                }
+            })
+            .finish(),
+        );
+    }
+
+    Flex::row()
+        .with_main_axis_size(MainAxisSize::Max)
+        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+        .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+        .with_child(label)
+        .with_child(dots_row.finish())
+        .finish()
 }
 
 #[derive(Default)]

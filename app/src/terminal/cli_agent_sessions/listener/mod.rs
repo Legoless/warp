@@ -1,7 +1,6 @@
 use warpui::{EntityId, ModelContext, ModelHandle, SingletonEntity};
 
 use super::{CLIAgentEvent, CLIAgentSessionsModel};
-use crate::features::FeatureFlag;
 use crate::terminal::cli_agent_sessions::event::{
     parse_event, CLIAgentEventPayload, CLIAgentEventSource, CLIAgentEventType,
 };
@@ -143,9 +142,6 @@ impl CLIAgentSessionHandler for CodexSessionHandler {
     ) -> Option<CLIAgentEvent> {
         if let Some(event) = parse_event(title, body) {
             if event.agent == CLIAgent::Codex {
-                if !FeatureFlag::CodexPlugin.is_enabled() {
-                    return None;
-                }
                 return Some(event);
             }
             return None;

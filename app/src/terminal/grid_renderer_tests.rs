@@ -1,16 +1,142 @@
 use pathfinder_geometry::rect::RectF;
 use pathfinder_geometry::vector::{vec2f, Vector2F};
+use warpui::color::ColorU;
 use warpui::fonts::Cache as FontCache;
 use warpui::units::{IntoLines, Lines, Pixels};
 
-use super::{active_or_next_match, CachedBackgroundColor};
+use super::{
+    active_or_next_match, cell_colors, CachedBackgroundColor, CellType, MinimalContrastCache,
+};
+use crate::settings::EnforceMinimumContrast;
 use crate::terminal::grid_size_util::calculate_grid_baseline_position;
+use crate::terminal::model::ansi::{Color, NamedColor};
+use crate::terminal::model::cell::Cell;
 use crate::terminal::model::index::Point;
 use crate::terminal::model::selection::SelectionPoint;
-use crate::terminal::{grid_renderer, SizeInfo};
+use crate::terminal::model::ObfuscateSecrets;
+use crate::terminal::{color, grid_renderer, SizeInfo};
 
 fn rect_from_points(min_x: f32, min_y: f32, max_x: f32, max_y: f32) -> RectF {
     RectF::from_points(vec2f(min_x, min_y), vec2f(max_x, max_y))
+}
+
+#[test]
+fn cell_colors_preserves_truecolor_foreground_and_background_when_contrast_disabled() {
+    let foreground = ColorU::new(140, 220, 120, 255);
+    let background = ColorU::new(20, 30, 90, 255);
+    let mut cell = Cell::default();
+    cell.c = 'x';
+    cell.fg = Color::Spec(foreground);
+    cell.bg = Color::Spec(background);
+    let colors = color::List::from(&color::Colors::default());
+    let override_colors = color::OverrideList::empty();
+    let mut minimal_contrast_cache = MinimalContrastCache::new();
+
+    let rendered = cell_colors(
+        &cell,
+        &colors,
+        &override_colors,
+        &CellType::default(),
+        255,
+        EnforceMinimumContrast::Never,
+        &mut minimal_contrast_cache,
+        None,
+        ObfuscateSecrets::No,
+    );
+
+    assert_eq!(rendered.foreground_color, foreground);
+    assert_eq!(rendered.background_color, background);
+}
+
+#[test]
+fn cell_colors_preserves_named_ansi_foreground_and_background_when_contrast_disabled() {
+    let mut cell = Cell::default();
+    cell.c = 'x';
+    cell.fg = Color::Named(NamedColor::Red);
+    cell.bg = Color::Named(NamedColor::Blue);
+    let colors = color::List::from(&color::Colors::default());
+    let override_colors = color::OverrideList::empty();
+    let mut minimal_contrast_cache = MinimalContrastCache::new();
+
+    let rendered = cell_colors(
+        &cell,
+        &colors,
+        &override_colors,
+        &CellType::default(),
+        255,
+        EnforceMinimumContrast::Never,
+        &mut minimal_contrast_cache,
+        None,
+        ObfuscateSecrets::No,
+    );
+
+    assert_eq!(
+        rendered.foreground_color,
+        colors[NamedColor::Red.into_color_index()]
+    );
+    assert_eq!(
+        rendered.background_color,
+        colors[NamedColor::Blue.into_color_index()]
+    );
+    assert_eq!(rendered.background_color.a, 255);
+}
+
+#[test]
+fn cell_colors_preserves_indexed_foreground_and_background_when_contrast_disabled() {
+    let mut cell = Cell::default();
+    cell.c = 'x';
+    cell.fg = Color::Indexed(208);
+    cell.bg = Color::Indexed(236);
+    let colors = color::List::from(&color::Colors::default());
+    let override_colors = color::OverrideList::empty();
+    let mut minimal_contrast_cache = MinimalContrastCache::new();
+
+    let rendered = cell_colors(
+        &cell,
+        &colors,
+        &override_colors,
+        &CellType::default(),
+        255,
+        EnforceMinimumContrast::Never,
+        &mut minimal_contrast_cache,
+        None,
+        ObfuscateSecrets::No,
+    );
+
+    assert_eq!(rendered.foreground_color, colors[208_usize]);
+    assert_eq!(rendered.background_color, colors[236_usize]);
+    assert_eq!(rendered.background_color.a, 255);
+}
+
+#[test]
+fn cell_colors_keeps_default_background_transparent() {
+    let mut cell = Cell::default();
+    cell.c = 'x';
+    cell.fg = Color::Named(NamedColor::Foreground);
+    cell.bg = Color::Named(NamedColor::Background);
+    let colors = color::List::from(&color::Colors::default());
+    let override_colors = color::OverrideList::empty();
+    let mut minimal_contrast_cache = MinimalContrastCache::new();
+
+    let rendered = cell_colors(
+        &cell,
+        &colors,
+        &override_colors,
+        &CellType::default(),
+        255,
+        EnforceMinimumContrast::Never,
+        &mut minimal_contrast_cache,
+        None,
+        ObfuscateSecrets::No,
+    );
+
+    assert_eq!(
+        rendered.background_color,
+        ColorU {
+            a: 0,
+            ..colors[NamedColor::Background.into_color_index()]
+        }
+    );
 }
 
 // TODO(CORE-2002): Make test non-Mac specific by switching to using bundled Roboto font.

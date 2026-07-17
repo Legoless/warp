@@ -43,6 +43,20 @@ use crate::terminal::shell::ShellType;
 use crate::ASSETS;
 
 const BASH_HISTORY_SIZE_SENTINEL: &str = "57265949261";
+const TERMINAL_TERM: &str = "xterm-256color";
+const TERMINAL_PROGRAM: &str = "WarpTerminal";
+const TERMINAL_COLORTERM: &str = "truecolor";
+const NO_COLOR_ENV: &str = "NO_COLOR";
+
+fn apply_interactive_terminal_color_env(builder: &mut Command) {
+    // These describe Warp's PTY, not the process that launched Warp. Reapply
+    // them after caller-provided env so a no-color launcher environment cannot
+    // make interactive TUIs such as Codex render monochrome.
+    builder.env("TERM", TERMINAL_TERM);
+    builder.env("TERM_PROGRAM", TERMINAL_PROGRAM);
+    builder.env("COLORTERM", TERMINAL_COLORTERM);
+    builder.env_remove(NO_COLOR_ENV);
+}
 
 /// Get raw fds for leader/follower ends of a new PTY.
 fn make_pty(size: winsize) -> Result<(RawFd, RawFd)> {
@@ -323,12 +337,6 @@ fn build_host_shell_command(
     }
     builder.env("HOME", &home_dir);
 
-    // Specify terminal name and capabilities.
-    builder.env("TERM", "xterm-256color");
-    builder.env("TERM_PROGRAM", "WarpTerminal");
-    // Advertise 24-bit color support.
-    builder.env("COLORTERM", "truecolor");
-
     // Prevent child processes from inheriting startup notification env.
     // See: https://specifications.freedesktop.org/startup-notification-spec/startup-notification-latest.txt
     builder.env_remove("DESKTOP_STARTUP_ID");
@@ -438,10 +446,12 @@ fn build_host_shell_command(
         builder.env("WARP_INITIAL_WORKING_DIR", start_dir);
     }
 
-    // Apply any caller-provided environment overrides last, so they win.
+    // Apply caller-provided environment, then reassert terminal capability
+    // variables that describe Warp's interactive PTY.
     for (key, value) in env_vars {
         builder.env(key, value);
     }
+    apply_interactive_terminal_color_env(&mut builder);
 
     // Set the initial working directory to the user's home directory.  If
     // `start_dir` is Some, we'll attempt to cd to that directory at the
@@ -864,9 +874,6 @@ fn build_docker_sandbox_command(
         builder.env("USER", &user_name);
     }
     builder.env("HOME", &home_dir);
-    builder.env("TERM", "xterm-256color");
-    builder.env("TERM_PROGRAM", "WarpTerminal");
-    builder.env("COLORTERM", "truecolor");
     builder.env_remove("DESKTOP_STARTUP_ID");
     if let Some(version) = ChannelState::app_version() {
         builder.env("TERM_PROGRAM_VERSION", version);
@@ -916,10 +923,12 @@ fn build_docker_sandbox_command(
     // the container's init script cds into the sandbox home dir, not
     // the host's startup dir.
 
-    // Apply any caller-provided environment overrides last, so they win.
+    // Apply caller-provided environment, then reassert terminal capability
+    // variables that describe Warp's interactive PTY.
     for (key, value) in env_vars {
         builder.env(key, value);
     }
+    apply_interactive_terminal_color_env(&mut builder);
 
     builder.current_dir(home_dir);
 
