@@ -1604,6 +1604,18 @@ define_settings_group!(AISettings, settings: [
         description: "Whether third-party file-based MCP servers are automatically detected.",
     }
 
+    // Whether Warp's built-in MCP control server should be registered and auto-started.
+    warp_control_mcp_server_enabled: WarpControlMcpServerEnabled {
+        type: bool,
+        default: false,
+        supported_platforms: SupportedPlatforms::DESKTOP,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
+        private: false,
+        toml_path: "agents.mcp_servers.warp_control_mcp_server_enabled",
+        description: "Whether Warp's built-in MCP control server is enabled.",
+    }
+
     // Controls how agent thinking/reasoning traces are displayed.
     thinking_display_mode: ThinkingDisplayMode,
 
@@ -1934,6 +1946,10 @@ impl AISettings {
         // solution (e.g. per-environment allowlisting, signed configs) should be
         // explored in the future.
         *self.file_based_mcp_enabled
+    }
+
+    pub fn is_warp_control_mcp_server_enabled(&self, _app: &warpui::AppContext) -> bool {
+        *self.warp_control_mcp_server_enabled
     }
 
     pub fn is_orchestration_enabled(&self, app: &warpui::AppContext) -> bool {

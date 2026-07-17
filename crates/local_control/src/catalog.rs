@@ -37,6 +37,8 @@ pub enum ActionParameterSpec {
     None,
     ActionName,
     BindingName,
+    BlockQuery,
+    BlockRead,
     BooleanValue,
     ColorValue,
     Direction,
@@ -52,6 +54,7 @@ pub enum ActionParameterSpec {
     TabClose,
     TabCreate,
     Text,
+    KeySequence,
     ThemeName,
 }
 
@@ -62,6 +65,8 @@ pub enum ActionResultSpec {
     Acknowledgement,
     ActiveTarget,
     AppearanceState,
+    BlockContent,
+    BlockList,
     CapabilityList,
     CapabilityMetadata,
     InstanceList,
@@ -122,6 +127,13 @@ macro_rules! define_action_catalog {
 
             pub fn as_str(self) -> &'static str {
                 self.spec().name
+            }
+
+            pub fn from_name(name: &str) -> Option<Self> {
+                Self::ALL
+                    .iter()
+                    .copied()
+                    .find(|kind| kind.as_str() == name)
             }
 
             pub fn metadata(self) -> ActionMetadata {
@@ -226,9 +238,15 @@ define_action_catalog! {
         SessionReopenClosed => { name: "session.reopen_closed", status: Implemented, target: Session, params: None, result: Acknowledgement },
     }
 
+    block {
+        BlockList => { name: "block.list", status: Implemented, target: Session, params: BlockQuery, result: BlockList },
+        BlockRead => { name: "block.read", status: Implemented, target: Session, params: BlockRead, result: BlockContent },
+    }
+
     input {
         InputInsert => { name: "input.insert", status: Implemented, target: Input, params: Text, result: Acknowledgement },
         InputReplace => { name: "input.replace", status: Implemented, target: Input, params: Text, result: Acknowledgement },
+        InputSendKeys => { name: "input.send_keys", status: Implemented, target: Input, params: KeySequence, result: Acknowledgement },
     }
 
     theme {

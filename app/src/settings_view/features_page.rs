@@ -75,7 +75,8 @@ use crate::settings::{
     SelectionSettings, ShowAutosuggestionIgnoreButton, ShowChangelogAfterUpdate,
     ShowTerminalInputMessageBar, SshSettings, SyntaxHighlighting, TabBehavior,
     UserNativeRedirectPreference, VimModeEnabled, VimStatusBar, VimUnnamedSystemClipboard,
-    DEFAULT_QUAKE_MODE_SIZE_PERCENTAGES, QUAKE_WINDOW_AUTOHIDE_SUPPORTED,
+    WarpControlMcpServerEnabled, DEFAULT_QUAKE_MODE_SIZE_PERCENTAGES,
+    QUAKE_WINDOW_AUTOHIDE_SUPPORTED,
 };
 use crate::terminal::alt_screen_reporting::{
     AltScreenReporting, FocusReportingEnabled, MouseReportingEnabled, ScrollReportingEnabled,
@@ -392,6 +393,14 @@ pub fn init_actions_from_parent_view<T: Action + Clone>(
         )
         .with_enabled(|| FeatureFlag::HOANotifications.is_enabled()),
     );
+    toggle_binding_pairs.push(ToggleSettingActionPair::new(
+        "Warp MCP server",
+        builder(SettingsAction::FeaturesPageToggle(
+            FeaturesPageAction::ToggleWarpControlMcpServer,
+        )),
+        context,
+        flags::WARP_CONTROL_MCP_SERVER_FLAG,
+    ));
 
     toggle_binding_pairs.push(
         ToggleSettingActionPair::new(
@@ -736,6 +745,7 @@ pub enum FeaturesPageAction {
     ToggleSshReuseControlMaster,
     ToggleSnackbar,
     ToggleLinkTooltip,
+    ToggleWarpControlMcpServer,
     ToggleCompletionsOpenWhileTyping,
     ToggleCommandCorrections,
     ToggleErrorUnderlining,
@@ -937,6 +947,10 @@ impl FeaturesPageAction {
             Self::ToggleLinkTooltip => TelemetryEvent::FeaturesPageAction {
                 action: "ToggleLinkTooltip".to_string(),
                 value: to_string(*GeneralSettings::as_ref(ctx).link_tooltip),
+            },
+            Self::ToggleWarpControlMcpServer => TelemetryEvent::FeaturesPageAction {
+                action: "ToggleWarpControlMcpServer".to_string(),
+                value: to_string(*AISettings::as_ref(ctx).warp_control_mcp_server_enabled),
             },
             Self::ToggleCompletionsOpenWhileTyping => TelemetryEvent::FeaturesPageAction {
                 action: "ToggleCompletionsOpenWhileTyping".to_string(),
@@ -1520,6 +1534,14 @@ impl TypedActionView for FeaturesPageView {
                         .reuse_existing_control_master
                         .toggle_and_save_value(ctx));
                 });
+            }
+            ToggleWarpControlMcpServer => {
+                AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings
+                        .warp_control_mcp_server_enabled
+                        .toggle_and_save_value(ctx));
+                });
+                ctx.notify();
             }
             OpenUrl(url) => {
                 ctx.open_url(url.as_str());
@@ -2294,6 +2316,7 @@ impl FeaturesPageView {
                 event,
                 AISettingsChangedEvent::IsAnyAIEnabled { .. }
                     | AISettingsChangedEvent::DefaultSessionMode { .. }
+                    | AISettingsChangedEvent::WarpControlMcpServerEnabled { .. }
             ) {
                 Self::update_default_session_mode_dropdown(
                     me.default_session_mode_dropdown.clone(),
@@ -2996,6 +3019,11 @@ impl FeaturesPageView {
             }
         }
 
+        let workflows_widgets: Vec<Box<dyn SettingsWidget<View = Self>>> = vec![
+            Box::new(WorkflowsInCommandSearch::default()),
+            Box::new(WarpControlMcpServerWidget::default()),
+        ];
+
         let categories = vec![
             Category::new("General", general_widgets),
             Category::new("Session", session_widgets),
@@ -3004,10 +3032,7 @@ impl FeaturesPageView {
             Category::new("Terminal Input", editor_widgets),
             Category::new("Terminal", terminal_widgets),
             Category::new("Notifications", notifications_widgets),
-            Category::new(
-                "Workflows",
-                vec![Box::new(WorkflowsInCommandSearch::default())],
-            ),
+            Category::new("Workflows", workflows_widgets),
             Category::new("System", system_widgets),
         ];
 
@@ -7369,6 +7394,59 @@ impl SettingsWidget for WorkflowsInCommandSearch {
                     ctx.dispatch_typed_action(
                         FeaturesPageAction::ToggleGlobalWorkflowsInUniversalSearch,
                     )
+                })
+                .finish(),
+            None,
+        )
+    }
+}
+
+#[derive(Default)]
+struct WarpControlMcpServerWidget {
+    switch_state: SwitchStateHandle,
+}
+
+impl SettingsWidget for WarpControlMcpServerWidget {
+    type View = FeaturesPageView;
+
+    fn search_terms(&self) -> &str {
+        "mcp model context protocol warp control server plugins agent"
+    }
+
+    fn should_render(&self, app: &AppContext) -> bool {
+        AISettings::as_ref(app)
+            .warp_control_mcp_server_enabled
+            .is_supported_on_current_platform()
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let ui_builder = appearance.ui_builder();
+        let ai_settings = AISettings::as_ref(app);
+        render_body_item::<FeaturesPageAction>(
+            "Enable Warp MCP server".into(),
+            None,
+            LocalOnlyIconState::for_setting(
+                WarpControlMcpServerEnabled::storage_key(),
+                WarpControlMcpServerEnabled::sync_to_cloud(),
+                &mut view
+                    .button_mouse_states
+                    .local_only_icon_tooltip_states
+                    .borrow_mut(),
+                app,
+            ),
+            ToggleState::Enabled,
+            appearance,
+            ui_builder
+                .switch(self.switch_state.clone())
+                .check(*ai_settings.warp_control_mcp_server_enabled)
+                .build()
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(FeaturesPageAction::ToggleWarpControlMcpServer);
                 })
                 .finish(),
             None,

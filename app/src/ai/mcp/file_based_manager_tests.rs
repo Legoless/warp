@@ -125,6 +125,15 @@ fn set_file_based_mcp_enabled(app: &mut App, enabled: bool) {
     });
 }
 
+fn set_warp_control_mcp_server_enabled(app: &mut App, enabled: bool) {
+    AISettings::handle(app).update(app, |settings, ctx| {
+        settings
+            .warp_control_mcp_server_enabled
+            .load_value(enabled, true, ctx)
+            .expect("load_value should succeed in tests");
+    });
+}
+
 #[test]
 fn servers_changed_only_emits_for_effective_source_set_changes() {
     let root_path = PathBuf::from("/tmp/test-repo");
@@ -418,6 +427,111 @@ fn test_global_warp_server_from_managed_home_root_always_spawns() {
                 e.despawned_uuids.is_empty(),
                 "Managed Warp MCP config should never be despawned by toggle changes, got: {:?}",
                 e.despawned_uuids
+            );
+        });
+    });
+}
+
+#[test]
+fn test_builtin_warp_control_server_is_global_warp_and_auto_spawns() {
+    let Some(root_path) = FileBasedMCPManager::builtin_warp_control_mcp_root_path() else {
+        return;
+    };
+
+    App::test((), |mut app| async move {
+        let manager = setup_app(&mut app);
+        let events = subscribe_events(&mut app, &manager);
+
+        manager.update(&mut app, |m, ctx| {
+            m.apply_builtin_warp_control_mcp_server(ctx);
+
+            let installation = m
+                .file_based_servers()
+                .into_iter()
+                .find(|installation| installation.templatable_mcp_server().name == "warp-control")
+                .expect("built-in Warp control MCP server should be registered");
+            let hash = installation
+                .hash()
+                .expect("built-in Warp control MCP server should have a hash");
+            let uuid = installation.uuid();
+            let template_json = installation.template_json().to_owned();
+
+            assert!(m.is_global_warp_server(hash));
+            assert_eq!(
+                m.directory_paths_for_installation_and_provider(uuid, MCPProvider::Warp),
+                vec![root_path.clone()]
+            );
+            assert!(template_json.contains(warp_mcp_server::MCP_SERVER_MODE_FLAG));
+            assert!(template_json.contains(warp_mcp_server::DEFAULT_PID_ENV));
+            let expected_pid = std::process::id().to_string();
+            assert_eq!(
+                installation
+                    .variable_values()
+                    .get(warp_mcp_server::DEFAULT_PID_ENV)
+                    .map(|value| value.value.as_str()),
+                Some(expected_pid.as_str())
+            );
+        });
+
+        events.update(&mut app, |e, _| {
+            assert_eq!(
+                e.spawned_uuids.len(),
+                1,
+                "Built-in Warp control MCP server should auto-spawn"
+            );
+        });
+    });
+}
+
+#[test]
+fn test_builtin_warp_control_server_respects_setting() {
+    App::test((), |mut app| async move {
+        let manager = setup_app(&mut app);
+        let events = subscribe_events(&mut app, &manager);
+
+        manager.update(&mut app, |m, ctx| {
+            m.sync_builtin_warp_control_mcp_server(ctx);
+            assert!(
+                m.file_based_servers().is_empty(),
+                "Built-in Warp control MCP server should stay unregistered by default"
+            );
+        });
+        events.update(&mut app, |e, _| {
+            assert!(
+                e.spawned_uuids.is_empty(),
+                "Built-in Warp control MCP server should not auto-spawn while setting is off"
+            );
+        });
+
+        set_warp_control_mcp_server_enabled(&mut app, true);
+        let installation_uuid = manager.update(&mut app, |m, _| {
+            let installation = m
+                .file_based_servers()
+                .into_iter()
+                .find(|installation| installation.templatable_mcp_server().name == "warp-control")
+                .expect("built-in Warp control MCP server should be registered after enabling");
+            installation.uuid()
+        });
+        events.update(&mut app, |e, _| {
+            assert_eq!(
+                e.spawned_uuids,
+                vec![installation_uuid],
+                "Built-in Warp control MCP server should spawn when setting is enabled"
+            );
+        });
+
+        set_warp_control_mcp_server_enabled(&mut app, false);
+        manager.update(&mut app, |m, _| {
+            assert!(
+                m.file_based_servers().is_empty(),
+                "Built-in Warp control MCP server should be unregistered after disabling"
+            );
+        });
+        events.update(&mut app, |e, _| {
+            assert_eq!(
+                e.despawned_uuids,
+                vec![installation_uuid],
+                "Built-in Warp control MCP server should despawn when setting is disabled"
             );
         });
     });

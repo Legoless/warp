@@ -15282,6 +15282,7 @@ dependencies = [
  "warp_js",
  "warp_logging",
  "warp_managed_secrets",
+ "warp_mcp_server",
  "warp_multi_agent_api",
  "warp_multi_agent_client",
  "warp_ripgrep",
@@ -15705,6 +15706,20 @@ dependencies = [
  "warp_isolation_platform",
  "warpui_core",
  "zeroize",
+]
+
+[[package]]
+name = "warp_mcp_server"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "local_control",
+ "rmcp",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tokio",
+ "warp_core",
 ]
 
 [[package]]

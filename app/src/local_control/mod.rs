@@ -25,7 +25,8 @@
 //!                 [0600 socket + kernel-reported peer UID]
 //!                                             |
 //!                                             v
-//!                           feature flag + Settings > Scripting gate
+//!                           feature flag / built-in MCP setting
+//!                           + Settings > Scripting or MCP opt-in gate
 //!                           + protocol + exact action metadata
 //!                                             |
 //!                                             v
@@ -52,11 +53,13 @@
 //! application: malicious software already running as the same user remains
 //! outside this boundary.
 //!
-//! The Settings > Scripting gates used here are local-only settings backed by
-//! Warp's secure storage provider.
+//! The Settings > Scripting gate used here is a local-only setting backed by
+//! Warp's secure storage provider. The built-in Warp MCP server has its own
+//! explicit opt-in under AI settings and shares the same control bridge.
 //!
 //! Discovery records never include raw bearer tokens: discovery only exposes
-//! endpoint metadata and credential broker references while Scripting is enabled.
+//! endpoint metadata and credential broker references while Scripting or the
+//! built-in Warp MCP server is enabled.
 mod bridge;
 mod handlers;
 mod permissions;
@@ -88,9 +91,8 @@ use axum::{Json, Router};
 pub use bridge::LocalControlBridge;
 #[cfg(any(unix, test))]
 use chrono::Duration;
-use permissions::ensure_feature_enabled;
 #[cfg(any(unix, test))]
-use permissions::{ensure_action_allowed, ensure_protocol_version};
+use permissions::{ensure_control_runtime_enabled, ensure_protocol_version};
 #[cfg(unix)]
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use warp_core::channel::ChannelState;
@@ -146,12 +148,25 @@ impl LocalControlServer {
                 }
             },
         );
+        ctx.subscribe_to_model(
+            &crate::settings::AISettings::handle(ctx),
+            |server, _, event, ctx| {
+                if matches!(
+                    event,
+                    crate::settings::AISettingsChangedEvent::WarpControlMcpServerEnabled { .. }
+                ) {
+                    if let Err(error) = server.refresh_for_settings(ctx) {
+                        log::warn!("Failed to refresh local-control server state: {error:#}");
+                    }
+                }
+            },
+        );
         server
     }
 
     /// Starts, refreshes, or removes local-control publication as settings change.
     fn refresh_for_settings(&mut self, ctx: &mut ModelContext<Self>) -> Result<(), ControlError> {
-        if !permissions::warp_control_cli_enabled() {
+        if !local_control_runtime_requested(ctx) {
             self.stop(ctx);
             return Ok(());
         }
@@ -159,7 +174,7 @@ impl LocalControlServer {
             self.stop(ctx);
             return Ok(());
         }
-        if !crate::settings::LocalControlSettings::as_ref(ctx).is_enabled() {
+        if !local_control_endpoint_enabled(ctx) {
             self.stop(ctx);
             return Ok(());
         }
@@ -188,14 +203,19 @@ impl LocalControlServer {
                 "local-control server is already running",
             ));
         }
-        ensure_feature_enabled()?;
+        if !local_control_runtime_requested(ctx) {
+            return Err(ControlError::new(
+                ErrorCode::LocalControlDisabled,
+                "Warp control is disabled",
+            ));
+        }
         if !local_control_publication_supported() {
             return Err(ControlError::new(
                 ErrorCode::LocalControlDisabled,
                 "local control is disabled until this platform enforces discovery-record ACLs",
             ));
         }
-        if !crate::settings::LocalControlSettings::as_ref(ctx).is_enabled() {
+        if !local_control_endpoint_enabled(ctx) {
             return Ok(());
         }
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -284,17 +304,29 @@ impl LocalControlServer {
     }
 }
 
+fn built_in_warp_control_mcp_enabled(ctx: &ModelContext<LocalControlServer>) -> bool {
+    crate::settings::AISettings::as_ref(ctx).is_warp_control_mcp_server_enabled(ctx)
+}
+
+fn local_control_runtime_requested(ctx: &ModelContext<LocalControlServer>) -> bool {
+    permissions::warp_control_cli_enabled() || built_in_warp_control_mcp_enabled(ctx)
+}
+
+fn local_control_endpoint_enabled(ctx: &ModelContext<LocalControlServer>) -> bool {
+    crate::settings::LocalControlSettings::as_ref(ctx).is_enabled()
+        || built_in_warp_control_mcp_enabled(ctx)
+}
+
 /// Builds routing metadata without embedding any bearer credential or secret.
 ///
-/// The endpoint and derived broker reference are published only while the
-/// protected Scripting setting permits clients to use them.
+/// The endpoint and derived broker reference are published only while either the
+/// protected Scripting setting or the explicit built-in Warp MCP setting permits
+/// clients to use them.
 fn discovery_record_for_settings(
     ctx: &ModelContext<LocalControlServer>,
     control_endpoint: ControlEndpoint,
 ) -> InstanceRecord {
-    let endpoint = crate::settings::LocalControlSettings::as_ref(ctx)
-        .is_enabled()
-        .then_some(control_endpoint);
+    let endpoint = local_control_endpoint_enabled(ctx).then_some(control_endpoint);
     InstanceRecord::for_current_process(
         endpoint,
         ChannelState::channel().to_string(),
@@ -452,7 +484,6 @@ async fn issue_credential(
     state: &ControlServerState,
     request: CredentialRequest,
 ) -> Result<ScopedCredential, ControlError> {
-    ensure_feature_enabled()?;
     ensure_protocol_version(request.protocol_version)?;
     if !request.action.is_implemented() {
         return Err(ControlError::new(
@@ -467,7 +498,10 @@ async fn issue_credential(
         .bridge_spawner
         .spawn({
             let action = request.action;
-            move |_, ctx| ensure_action_allowed(action, ctx)
+            move |_, ctx| {
+                ensure_control_runtime_enabled(ctx)?;
+                permissions::ensure_action_allowed(action, ctx)
+            }
         })
         .await
         .map_err(|_| {
@@ -511,13 +545,6 @@ async fn handle_control_request(
     payload: Bytes,
 ) -> Response {
     if let Err(error) = validate_loopback_headers(&headers, &state.expected_host) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(ErrorResponseEnvelope::new(error)),
-        )
-            .into_response();
-    }
-    if let Err(error) = ensure_feature_enabled() {
         return (
             StatusCode::FORBIDDEN,
             Json(ErrorResponseEnvelope::new(error)),
@@ -680,7 +707,9 @@ pub(crate) fn validate_loopback_headers(
 #[cfg(test)]
 pub(crate) use bridge::validate_request_authority;
 #[cfg(test)]
-pub(crate) use permissions::{capabilities, ensure_settings_allow_action};
+pub(crate) use permissions::{
+    capabilities, ensure_action_allowed, ensure_feature_enabled, ensure_settings_allow_action,
+};
 #[cfg(test)]
 pub(crate) use resolver::{
     require_active_window_id, resolve_index_from_ids, resolve_title_from_matches,

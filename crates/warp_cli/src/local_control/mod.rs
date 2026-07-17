@@ -9,10 +9,10 @@ use std::process::ExitCode;
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use clap_complete::aot::Shell;
 use commands::{
-    run_action_catalog_command, run_app_command, run_appearance_command, run_capability_command,
-    run_file_command, run_input_command, run_instance_command, run_keybinding_command,
-    run_pane_command, run_session_command, run_setting_command, run_surface_command,
-    run_tab_command, run_theme_command, run_window_command,
+    run_action_catalog_command, run_app_command, run_appearance_command, run_block_command,
+    run_capability_command, run_file_command, run_input_command, run_instance_command,
+    run_keybinding_command, run_pane_command, run_session_command, run_setting_command,
+    run_surface_command, run_tab_command, run_theme_command, run_window_command,
 };
 use completions::generate_completions_to_stdout;
 use output::write_control_error;
@@ -163,6 +163,10 @@ pub enum ControlCommand {
     /// Inspect local Warp sessions.
     #[command(subcommand)]
     Session(SessionCommand),
+
+    /// Inspect terminal blocks.
+    #[command(subcommand)]
+    Block(BlockCommand),
 
     /// Inspect terminal input state.
     #[command(subcommand)]
@@ -374,12 +378,24 @@ pub enum SessionCommand {
 }
 
 #[derive(Debug, Clone, Subcommand)]
+pub enum BlockCommand {
+    /// List blocks in a terminal session.
+    List(BlockListArgs),
+
+    /// Read one block from a terminal session.
+    Read(BlockReadArgs),
+}
+
+#[derive(Debug, Clone, Subcommand)]
 pub enum InputCommand {
     /// Insert text into the input buffer without submitting it.
     Insert(TextTargetArgs),
 
     /// Replace the input buffer without submitting it.
     Replace(TextTargetArgs),
+
+    /// Send text and terminal key sequences directly to the PTY.
+    SendKeys(KeySequenceTargetArgs),
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -696,6 +712,56 @@ pub struct TextTargetArgs {
 }
 
 #[derive(Debug, Clone, Args)]
+pub struct KeySequenceTargetArgs {
+    /// Text bytes to write before any key sequence entries.
+    #[arg(long = "text")]
+    pub text: Option<String>,
+
+    /// Keystrokes such as `enter`, `ctrl-c`, `up`, or `shift-tab`.
+    #[arg(value_name = "KEY")]
+    pub keys: Vec<String>,
+
+    #[command(flatten)]
+    pub target: TargetArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct BlockListArgs {
+    #[command(flatten)]
+    pub target: TargetArgs,
+
+    #[arg(long = "limit")]
+    pub limit: Option<u32>,
+
+    #[arg(long = "include-hidden")]
+    pub include_hidden: bool,
+
+    #[arg(long = "include-output")]
+    pub include_output: bool,
+
+    #[arg(long = "max-output-chars")]
+    pub max_output_chars: Option<usize>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct BlockReadArgs {
+    #[command(flatten)]
+    pub target: TargetArgs,
+
+    #[arg(conflicts_with = "index")]
+    pub block_id: Option<String>,
+
+    #[arg(long = "index", conflicts_with = "block_id")]
+    pub index: Option<u32>,
+
+    #[arg(long = "no-output")]
+    pub no_output: bool,
+
+    #[arg(long = "max-output-chars")]
+    pub max_output_chars: Option<usize>,
+}
+
+#[derive(Debug, Clone, Args)]
 pub struct PageQueryArgs {
     #[arg(long = "page")]
     pub page: Option<String>,
@@ -926,6 +992,7 @@ fn run_inner(args: ControlArgs) -> Result<(), local_control::protocol::ControlEr
         ControlCommand::Tab(command) => run_tab_command(command, output_format),
         ControlCommand::Pane(command) => run_pane_command(command, output_format),
         ControlCommand::Session(command) => run_session_command(command, output_format),
+        ControlCommand::Block(command) => run_block_command(command, output_format),
         ControlCommand::Input(command) => run_input_command(command, output_format),
         ControlCommand::Theme(command) => run_theme_command(command, output_format),
         ControlCommand::Appearance(command) => run_appearance_command(command, output_format),

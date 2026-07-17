@@ -52,13 +52,24 @@ impl FileBasedMCPManager {
             ctx.subscribe_to_model(&FileMCPWatcher::handle(ctx), |me, _, event, ctx| {
                 me.handle_watcher_event(event, ctx);
             });
+        }
 
-            ctx.subscribe_to_model(&AISettings::handle(ctx), |me, _, event, ctx| {
-                if matches!(event, AISettingsChangedEvent::FileBasedMcpEnabled { .. }) {
+        ctx.subscribe_to_model(&AISettings::handle(ctx), |me, _, event, ctx| match event {
+            AISettingsChangedEvent::FileBasedMcpEnabled { .. } => {
+                if FeatureFlag::FileBasedMcp.is_enabled() {
                     me.handle_file_based_mcp_enabled_change(ctx);
                 }
-            });
-        }
+            }
+            AISettingsChangedEvent::WarpControlMcpServerEnabled { .. } => {
+                me.sync_builtin_warp_control_mcp_server(ctx);
+            }
+            _ => {}
+        });
+
+        #[cfg(not(test))]
+        let _ = ctx.spawn(async {}, |me, _, ctx| {
+            me.sync_builtin_warp_control_mcp_server(ctx);
+        });
 
         Self {
             file_based_servers: Default::default(),
@@ -68,6 +79,64 @@ impl FileBasedMCPManager {
             defer_global_warp_autostart,
             global_warp_servers_activated: !defer_global_warp_autostart,
         }
+    }
+
+    fn sync_builtin_warp_control_mcp_server(&mut self, ctx: &mut ModelContext<Self>) {
+        if AISettings::as_ref(ctx).is_warp_control_mcp_server_enabled(ctx) {
+            self.apply_builtin_warp_control_mcp_server(ctx);
+        } else {
+            self.remove_builtin_warp_control_mcp_server(ctx);
+        }
+    }
+
+    fn builtin_warp_control_mcp_root_path() -> Option<PathBuf> {
+        warp_managed_mcp_config_path().map(|path| path.root_path.join(".warp").join("builtin-mcp"))
+    }
+
+    fn apply_builtin_warp_control_mcp_server(&mut self, ctx: &mut ModelContext<Self>) {
+        let Some(root_path) = Self::builtin_warp_control_mcp_root_path() else {
+            log::warn!(
+                "Could not register built-in Warp MCP server: Warp MCP root path unavailable"
+            );
+            return;
+        };
+        let command = match std::env::current_exe() {
+            Ok(command) => command,
+            Err(err) => {
+                log::warn!("Could not register built-in Warp MCP server: {err}");
+                return;
+            }
+        };
+        let mut env = serde_json::Map::new();
+        env.insert(
+            warp_mcp_server::DEFAULT_PID_ENV.to_owned(),
+            serde_json::Value::String(std::process::id().to_string()),
+        );
+        let config = serde_json::json!({
+            "mcpServers": {
+                "warp-control": {
+                    "command": command.to_string_lossy().into_owned(),
+                    "args": [warp_mcp_server::MCP_SERVER_MODE_FLAG],
+                    "env": env,
+                }
+            }
+        });
+        let parsed_servers =
+            match ParsedTemplatableMCPServerResult::from_config_file_json(&config.to_string()) {
+                Ok(parsed_servers) => parsed_servers,
+                Err(err) => {
+                    log::warn!("Could not parse built-in Warp MCP server config: {err}");
+                    return;
+                }
+            };
+        self.apply_parsed_servers(root_path, MCPProvider::Warp, parsed_servers, ctx);
+    }
+
+    fn remove_builtin_warp_control_mcp_server(&mut self, ctx: &mut ModelContext<Self>) {
+        let Some(root_path) = Self::builtin_warp_control_mcp_root_path() else {
+            return;
+        };
+        self.remove_servers_for_root_provider(&root_path, MCPProvider::Warp, ctx);
     }
 
     /// Handle an event from [`FileMCPWatcher`].
@@ -122,7 +191,11 @@ impl FileBasedMCPManager {
         let repo_root = DetectedRepositories::as_ref(app)
             .get_root_for_path(&LocalOrRemotePath::Local(cwd.to_path_buf()))
             .and_then(|r| PathBuf::try_from(r).ok());
-        let candidate_roots = [dirs::home_dir(), repo_root];
+        let candidate_roots = [
+            dirs::home_dir(),
+            Self::builtin_warp_control_mcp_root_path(),
+            repo_root,
+        ];
 
         let mut servers = Vec::new();
         for root in candidate_roots.into_iter().flatten() {
@@ -152,6 +225,13 @@ impl FileBasedMCPManager {
             .file_based_servers_by_root
             .get_mut(root_path)
             .and_then(|m| m.remove(&provider));
+        if self
+            .file_based_servers_by_root
+            .get(root_path)
+            .is_some_and(|m| m.is_empty())
+        {
+            self.file_based_servers_by_root.remove(root_path);
+        }
         if let Some(hashes) = hashes {
             let servers_changed = !hashes.is_empty();
             self.remove_if_orphaned(hashes, ctx);
@@ -331,6 +411,8 @@ impl FileBasedMCPManager {
 
     fn is_global_warp_root(root_path: &Path) -> bool {
         warp_managed_mcp_config_path().is_some_and(|path| root_path == path.root_path.as_path())
+            || Self::builtin_warp_control_mcp_root_path()
+                .is_some_and(|path| root_path == path.as_path())
     }
     fn auto_start_decision(&self, hash: u64, file_based_mcp_enabled: bool) -> AutoStartDecision {
         let server_type = if self.is_global_warp_server(hash) {

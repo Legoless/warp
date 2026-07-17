@@ -83,7 +83,6 @@ fn surface_list_accepts_instance_selection() {
 fn rejects_excluded_command_routes() {
     for args in [
         vec!["warpctrl", "history", "list"],
-        vec!["warpctrl", "block", "list"],
         vec!["warpctrl", "block", "inspect", "block_1"],
         vec!["warpctrl", "block", "output", "block_1"],
         vec!["warpctrl", "input", "get"],
@@ -209,7 +208,7 @@ fn instance_list_output_serializes_empty_and_populated_lists() {
 
 #[test]
 fn excluded_actions_are_not_allowlisted_catalog_entries() {
-    for excluded in ["auth.api_key.set", "file.write", "block.list"] {
+    for excluded in ["auth.api_key.set", "file.write", "block.inspect"] {
         assert!(
             ActionKind::ALL
                 .iter()
@@ -228,8 +227,8 @@ fn generated_bash_completions_include_readonly_commands() {
     assert!(!completions.contains("stubs-only"));
     assert!(completions.contains("window"));
     assert!(completions.contains("input"));
+    assert!(completions.contains("block"));
     assert!(completions.contains("completions"));
-    assert!(!completions.contains("block"));
 }
 
 #[test]
@@ -419,6 +418,11 @@ fn retained_action_examples() -> Vec<(ActionKind, Vec<&'static str>)> {
             ActionKind::SessionReopenClosed,
             vec!["warpctrl", "session", "reopen-closed"],
         ),
+        (ActionKind::BlockList, vec!["warpctrl", "block", "list"]),
+        (
+            ActionKind::BlockRead,
+            vec!["warpctrl", "block", "read", "block_1"],
+        ),
         (
             ActionKind::InputInsert,
             vec!["warpctrl", "input", "insert", "hello"],
@@ -426,6 +430,10 @@ fn retained_action_examples() -> Vec<(ActionKind, Vec<&'static str>)> {
         (
             ActionKind::InputReplace,
             vec!["warpctrl", "input", "replace", "hello"],
+        ),
+        (
+            ActionKind::InputSendKeys,
+            vec!["warpctrl", "input", "send-keys", "--text", "pwd", "enter"],
         ),
         (ActionKind::ThemeList, vec!["warpctrl", "theme", "list"]),
         (ActionKind::ThemeGet, vec!["warpctrl", "theme", "get"]),
@@ -645,9 +653,14 @@ fn parsed_action_kind(command: &ControlCommand) -> Option<ActionKind> {
             SessionCommand::Next(_) => Some(ActionKind::SessionNext),
             SessionCommand::ReopenClosed(_) => Some(ActionKind::SessionReopenClosed),
         },
+        ControlCommand::Block(command) => match command {
+            BlockCommand::List(_) => Some(ActionKind::BlockList),
+            BlockCommand::Read(_) => Some(ActionKind::BlockRead),
+        },
         ControlCommand::Input(command) => match command {
             InputCommand::Insert(_) => Some(ActionKind::InputInsert),
             InputCommand::Replace(_) => Some(ActionKind::InputReplace),
+            InputCommand::SendKeys(_) => Some(ActionKind::InputSendKeys),
         },
         ControlCommand::Theme(command) => match command {
             ThemeCommand::List(_) => Some(ActionKind::ThemeList),

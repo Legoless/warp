@@ -1,11 +1,11 @@
 //! Implementations for user-facing `warpctrl` command groups.
 use local_control::discovery::InstanceRecord;
 use local_control::protocol::{
-    Action, ActionKind, ActionNameParams, BindingNameParams, BooleanValueParams, ColorValueParams,
-    ControlError, DirectionParams, EmptyParams, ErrorCode, FileOpenParams, KeyParams,
-    KeyValueParams, PageQueryParams, QueryParams, RenameParams, RequestEnvelope, ResizeParams,
-    SettingListParams, TabActivateParams, TabActivationMode, TabCloseMode, TabCloseParams,
-    TabCreateParams, TextParams, ThemeNameParams,
+    Action, ActionKind, ActionNameParams, BindingNameParams, BlockQueryParams, BlockReadParams,
+    BooleanValueParams, ColorValueParams, ControlError, DirectionParams, EmptyParams, ErrorCode,
+    FileOpenParams, KeyParams, KeySequenceParams, KeyValueParams, PageQueryParams, QueryParams,
+    RenameParams, RequestEnvelope, ResizeParams, SettingListParams, TabActivateParams,
+    TabActivationMode, TabCloseMode, TabCloseParams, TabCreateParams, TextParams, ThemeNameParams,
 };
 use local_control::selection::select_instance;
 use serde::Serialize;
@@ -15,11 +15,11 @@ use crate::agent::OutputFormat;
 use crate::local_control::output::{write_json, write_json_line};
 use crate::local_control::selectors::{instance_selector, target_selector};
 use crate::local_control::{
-    ActionCatalogCommand, AppCommand, AppearanceCommand, CapabilityCommand, FileCommand,
-    InputCommand, InstanceCommand, KeybindingCommand, PaneCommand, SessionCommand, SettingCommand,
-    SurfaceCommand, SurfaceOpenCommand, SurfaceOpenToggleCommand, SurfaceQueryCommand,
-    SurfaceSettingsCommand, SurfaceToggleCommand, TabActivateArgs, TabCloseArgs, TabColorCommand,
-    TabCommand, TargetArgs, ThemeCommand, WindowCommand,
+    ActionCatalogCommand, AppCommand, AppearanceCommand, BlockCommand, CapabilityCommand,
+    FileCommand, InputCommand, InstanceCommand, KeybindingCommand, PaneCommand, SessionCommand,
+    SettingCommand, SurfaceCommand, SurfaceOpenCommand, SurfaceOpenToggleCommand,
+    SurfaceQueryCommand, SurfaceSettingsCommand, SurfaceToggleCommand, TabActivateArgs,
+    TabCloseArgs, TabColorCommand, TabCommand, TargetArgs, ThemeCommand, WindowCommand,
 };
 
 pub(super) fn run_surface_command(
@@ -522,6 +522,36 @@ pub(super) fn run_session_command(
     }
 }
 
+pub(super) fn run_block_command(
+    command: BlockCommand,
+    output_format: OutputFormat,
+) -> Result<(), ControlError> {
+    match command {
+        BlockCommand::List(args) => run_action_with_params(
+            args.target,
+            ActionKind::BlockList,
+            BlockQueryParams {
+                limit: args.limit,
+                include_hidden: args.include_hidden,
+                include_output: args.include_output,
+                max_output_chars: args.max_output_chars,
+            },
+            output_format,
+        ),
+        BlockCommand::Read(args) => run_action_with_params(
+            args.target,
+            ActionKind::BlockRead,
+            BlockReadParams {
+                block_id: args.block_id,
+                index: args.index,
+                include_output: !args.no_output,
+                max_output_chars: args.max_output_chars,
+            },
+            output_format,
+        ),
+    }
+}
+
 pub(super) fn run_input_command(
     command: InputCommand,
     output_format: OutputFormat,
@@ -537,6 +567,15 @@ pub(super) fn run_input_command(
             args.target,
             ActionKind::InputReplace,
             TextParams { text: args.text },
+            output_format,
+        ),
+        InputCommand::SendKeys(args) => run_action_with_params(
+            args.target,
+            ActionKind::InputSendKeys,
+            KeySequenceParams {
+                keys: args.keys,
+                text: args.text,
+            },
             output_format,
         ),
     }

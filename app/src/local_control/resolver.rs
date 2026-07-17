@@ -1,18 +1,24 @@
 //! Target resolution and parameter validation for retained local-control actions.
 use ::local_control::protocol::{
-    ActionNameParams, ActionParameterSpec, BindingNameParams, BooleanValueParams, ColorValueParams,
-    DirectionParams, EmptyParams, FileOpenParams, KeyParams, KeyValueParams, NamespaceParams,
-    PageQueryParams, PaneTarget, QueryParams, RenameParams, ResizeParams, SessionTarget,
-    TabActivateParams, TabCloseParams, TabCreateParams, TabTarget, TargetSelector, TextParams,
-    ThemeNameParams, WindowTarget,
+    ActionNameParams, ActionParameterSpec, BindingNameParams, BlockQueryParams, BlockReadParams,
+    BooleanValueParams, ColorValueParams, DirectionParams, EmptyParams, FileOpenParams, KeyParams,
+    KeySequenceParams, KeyValueParams, NamespaceParams, PageQueryParams, PaneTarget, QueryParams,
+    RenameParams, ResizeParams, SessionTarget, TabActivateParams, TabCloseParams, TabCreateParams,
+    TabTarget, TargetSelector, TextParams, ThemeNameParams, WindowTarget,
 };
 use ::local_control::{ActionKind, ControlError, ErrorCode, TargetScope};
 use warpui::{AppContext, ModelContext, TypedActionView, ViewHandle, WindowId};
+use warpui_core::keymap::Keystroke;
 
 use crate::local_control::handlers::metadata::action_metadata_for_name;
 use crate::local_control::LocalControlBridge;
 use crate::pane_group::{ActivationReason, PaneGroup, PaneGroupAction, PaneId};
 use crate::workspace::{Workspace, WorkspaceAction};
+
+const MAX_BLOCK_LIST_LIMIT: u32 = 500;
+const MAX_BLOCK_OUTPUT_CHARS: usize = 1_000_000;
+const MAX_SEND_TEXT_CHARS: usize = 100_000;
+const MAX_KEY_SEQUENCE_KEYS: usize = 256;
 
 pub(crate) fn validate_tab_create_target(target: &TargetSelector) -> Result<(), ControlError> {
     if target.tab.is_some() || target.pane.is_some() || target.session.is_some() {
@@ -35,6 +41,8 @@ pub(crate) fn validate_action_params(action: &::local_control::Action) -> Result
             action_metadata_for_name(&params.action).map(|_| ())
         }
         ActionParameterSpec::BindingName => parse_params::<BindingNameParams>(action),
+        ActionParameterSpec::BlockQuery => validate_block_query_params(action),
+        ActionParameterSpec::BlockRead => validate_block_read_params(action),
         ActionParameterSpec::BooleanValue => parse_params::<BooleanValueParams>(action),
         ActionParameterSpec::ColorValue => parse_params::<ColorValueParams>(action),
         ActionParameterSpec::Direction => parse_params::<DirectionParams>(action),
@@ -50,7 +58,116 @@ pub(crate) fn validate_action_params(action: &::local_control::Action) -> Result
         ActionParameterSpec::TabClose => parse_params::<TabCloseParams>(action),
         ActionParameterSpec::TabCreate => parse_params::<TabCreateParams>(action),
         ActionParameterSpec::Text => parse_params::<TextParams>(action),
+        ActionParameterSpec::KeySequence => validate_key_sequence_params(action),
         ActionParameterSpec::ThemeName => parse_params::<ThemeNameParams>(action),
+    }
+}
+
+fn validate_block_query_params(action: &::local_control::Action) -> Result<(), ControlError> {
+    let params = action.params_as::<BlockQueryParams>()?;
+    if params
+        .limit
+        .is_some_and(|limit| limit > MAX_BLOCK_LIST_LIMIT)
+    {
+        return Err(ControlError::new(
+            ErrorCode::InvalidParams,
+            format!(
+                "{} limit must be at most {MAX_BLOCK_LIST_LIMIT}",
+                action.kind.as_str()
+            ),
+        ));
+    }
+    validate_max_output_chars(action.kind, params.max_output_chars)
+}
+
+fn validate_block_read_params(action: &::local_control::Action) -> Result<(), ControlError> {
+    let params = action.params_as::<BlockReadParams>()?;
+    if params.block_id.is_some() && params.index.is_some() {
+        return Err(ControlError::new(
+            ErrorCode::InvalidParams,
+            format!(
+                "{} accepts block_id or index, but not both",
+                action.kind.as_str()
+            ),
+        ));
+    }
+    validate_max_output_chars(action.kind, params.max_output_chars)
+}
+
+fn validate_max_output_chars(
+    action: ActionKind,
+    max_output_chars: Option<usize>,
+) -> Result<(), ControlError> {
+    if max_output_chars.is_some_and(|value| value > MAX_BLOCK_OUTPUT_CHARS) {
+        return Err(ControlError::new(
+            ErrorCode::InvalidParams,
+            format!(
+                "{} max_output_chars must be at most {MAX_BLOCK_OUTPUT_CHARS}",
+                action.as_str()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_key_sequence_params(action: &::local_control::Action) -> Result<(), ControlError> {
+    let params = action.params_as::<KeySequenceParams>()?;
+    if params.text.as_deref().unwrap_or_default().is_empty() && params.keys.is_empty() {
+        return Err(ControlError::new(
+            ErrorCode::InvalidParams,
+            format!("{} requires text or at least one key", action.kind.as_str()),
+        ));
+    }
+    if params.keys.len() > MAX_KEY_SEQUENCE_KEYS {
+        return Err(ControlError::new(
+            ErrorCode::InvalidParams,
+            format!(
+                "{} accepts at most {MAX_KEY_SEQUENCE_KEYS} keys",
+                action.kind.as_str()
+            ),
+        ));
+    }
+    if params
+        .text
+        .as_ref()
+        .is_some_and(|text| text.chars().count() > MAX_SEND_TEXT_CHARS)
+    {
+        return Err(ControlError::new(
+            ErrorCode::InvalidParams,
+            format!(
+                "{} text must be at most {MAX_SEND_TEXT_CHARS} characters",
+                action.kind.as_str()
+            ),
+        ));
+    }
+    if params
+        .text
+        .as_ref()
+        .is_some_and(|text| text.chars().any(|character| character == '\0'))
+    {
+        return Err(ControlError::new(
+            ErrorCode::InvalidParams,
+            format!("{} text cannot contain NUL bytes", action.kind.as_str()),
+        ));
+    }
+    for key in &params.keys {
+        validate_keystroke_param(action.kind, key)?;
+    }
+    Ok(())
+}
+
+fn validate_keystroke_param(action: ActionKind, key: &str) -> Result<(), ControlError> {
+    match std::panic::catch_unwind(|| Keystroke::parse(key)) {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(err)) => Err(ControlError::with_details(
+            ErrorCode::InvalidParams,
+            format!("{} received an invalid key sequence entry", action.as_str()),
+            err.to_string(),
+        )),
+        Err(_) => Err(ControlError::new(
+            ErrorCode::InvalidParams,
+            format!("{} received an invalid key sequence entry", action.as_str()),
+        )),
     }
 }
 

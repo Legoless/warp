@@ -19,14 +19,16 @@ use warpui::SingletonEntity as _;
 use super::ensure_peer_uid;
 use super::resolver::validate_action_target;
 use super::{
-    capabilities, ensure_feature_enabled, ensure_protocol_version, ensure_settings_allow_action,
-    handle_control_request, insert_credential, issue_credential, lookup_credential,
-    require_active_window_id, resolve_index_from_ids, resolve_title_from_matches,
-    validate_action_params, validate_loopback_headers, validate_request_authority,
-    validate_tab_create_target, ControlServerState, LocalControlBridge, LocalControlServer,
-    MAX_ACTIVE_CREDENTIALS,
+    capabilities, ensure_action_allowed, ensure_feature_enabled, ensure_protocol_version,
+    ensure_settings_allow_action, handle_control_request, insert_credential, issue_credential,
+    lookup_credential, require_active_window_id, resolve_index_from_ids,
+    resolve_title_from_matches, validate_action_params, validate_loopback_headers,
+    validate_request_authority, validate_tab_create_target, ControlServerState, LocalControlBridge,
+    LocalControlServer, MAX_ACTIVE_CREDENTIALS,
 };
-use crate::settings::{LocalControlMode, LocalControlModeSetting, LocalControlSettings};
+use crate::settings::{
+    AISettings, LocalControlMode, LocalControlModeSetting, LocalControlSettings,
+};
 
 fn settings_with_mode(mode: LocalControlMode) -> LocalControlSettings {
     LocalControlSettings {
@@ -153,7 +155,7 @@ fn surface_list_rejects_target_selectors() {
 
 #[test]
 fn capabilities_advertises_the_complete_catalog() {
-    assert_eq!(capabilities().len(), 84);
+    assert_eq!(capabilities().len(), 87);
 }
 
 #[test]
@@ -252,6 +254,50 @@ fn duplicate_server_start_is_rejected() {
 }
 
 #[test]
+fn builtin_mcp_setting_starts_local_control_server_when_scripting_is_disabled() {
+    let _flag = FeatureFlag::WarpControlCli.override_enabled(false);
+    if !super::local_control_publication_supported() {
+        return;
+    }
+
+    warpui::App::test((), |mut app| async move {
+        crate::test_util::settings::initialize_settings_for_tests(&mut app);
+        app.add_singleton_model(LocalControlBridge::new);
+        let server = app.add_singleton_model(LocalControlServer::new);
+
+        server.update(&mut app, |server, _| {
+            assert!(
+                server._runtime.is_none(),
+                "server should stay stopped when both local control and built-in MCP are disabled"
+            );
+        });
+
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings
+                .warp_control_mcp_server_enabled
+                .load_value(true, true, ctx)
+                .expect("MCP setting should update");
+        });
+
+        let runtime = server.update(&mut app, |server, _| {
+            assert!(
+                server._runtime.is_some(),
+                "built-in MCP setting should start local-control publication"
+            );
+            assert!(server.control_endpoint.is_some());
+            assert!(server.registered_instance.is_some());
+
+            server.registered_instance = None;
+            server.control_endpoint = None;
+            server._runtime.take()
+        });
+        if let Some(runtime) = runtime {
+            runtime.shutdown_background();
+        }
+    });
+}
+
+#[test]
 fn scripting_disabled_denies_action() {
     let settings = settings_with_mode(LocalControlMode::Disabled);
 
@@ -267,6 +313,27 @@ fn scripting_enabled_allows_action() {
         ActionKind::TabCreate,
     )
     .expect("enabled scripting allows action");
+}
+
+#[test]
+fn builtin_mcp_setting_allows_action_when_scripting_is_disabled() {
+    let _flag = FeatureFlag::WarpControlCli.override_enabled(false);
+    warpui::App::test((), |mut app| async move {
+        crate::test_util::settings::initialize_settings_for_tests(&mut app);
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings
+                .warp_control_mcp_server_enabled
+                .load_value(true, true, ctx)
+                .expect("MCP setting should update");
+        });
+
+        let bridge = app.add_singleton_model(LocalControlBridge::new);
+        bridge
+            .update(&mut app, |_, ctx| {
+                ensure_action_allowed(ActionKind::AppPing, ctx)
+            })
+            .expect("built-in MCP setting should allow actions through the bridge");
+    });
 }
 
 #[test]
@@ -437,6 +504,49 @@ fn disabling_scripting_invalidates_existing_grant_and_prevents_new_grants() {
         let err = issue_credential(&state, CredentialRequest::new(ActionKind::AppPing))
             .await
             .expect_err("disabled scripting should prevent new grants");
+        assert_eq!(err.code, ErrorCode::LocalControlDisabled);
+    });
+}
+
+#[test]
+fn builtin_mcp_setting_issues_credential_when_scripting_is_disabled() {
+    let _flag = FeatureFlag::WarpControlCli.override_enabled(false);
+    warpui::App::test((), |mut app| async move {
+        crate::test_util::settings::initialize_settings_for_tests(&mut app);
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings
+                .warp_control_mcp_server_enabled
+                .load_value(true, true, ctx)
+                .expect("MCP setting should update");
+        });
+
+        let instance_id = InstanceId("inst_test".to_owned());
+        let expected_host = "127.0.0.1:1234".to_owned();
+        let bridge = app.add_singleton_model(LocalControlBridge::new);
+        let state = bridge.update(&mut app, |bridge, ctx| {
+            bridge.set_instance_id(instance_id.clone());
+            ControlServerState {
+                bridge_spawner: ctx.spawner(),
+                instance_id: instance_id.clone(),
+                expected_host: expected_host.clone(),
+                credentials: Default::default(),
+            }
+        });
+
+        let credential = issue_credential(&state, CredentialRequest::new(ActionKind::AppPing))
+            .await
+            .expect("built-in MCP setting should issue credentials");
+        assert_eq!(credential.grant.action, ActionKind::AppPing);
+
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings
+                .warp_control_mcp_server_enabled
+                .load_value(false, true, ctx)
+                .expect("MCP setting should update");
+        });
+        let err = issue_credential(&state, CredentialRequest::new(ActionKind::AppPing))
+            .await
+            .expect_err("disabled MCP and scripting should deny credentials");
         assert_eq!(err.code, ErrorCode::LocalControlDisabled);
     });
 }

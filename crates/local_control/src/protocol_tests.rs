@@ -130,7 +130,6 @@ fn malformed_and_removed_action_names_are_not_deserialized() {
         "tab.create.extra",
         "auth.status",
         "auth.login",
-        "block.list",
         "block.inspect",
         "block.output",
         "history.list",
@@ -157,8 +156,8 @@ fn malformed_and_removed_action_names_are_not_deserialized() {
 }
 
 #[test]
-fn catalog_has_exactly_84_retained_actions() {
-    assert_eq!(ActionKind::ALL.len(), 84);
+fn catalog_has_exactly_87_retained_actions() {
+    assert_eq!(ActionKind::ALL.len(), 87);
 }
 
 #[test]
