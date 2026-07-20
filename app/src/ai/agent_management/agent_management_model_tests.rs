@@ -4,6 +4,7 @@ use warp_errors::report_if_error;
 use warpui::{App, EntityId, ModelHandle, SingletonEntity};
 
 use super::AgentNotificationsModel;
+use crate::BlocklistAIHistoryModel;
 use crate::ai::active_agent_views_model::{ActiveAgentViewsEvent, ActiveAgentViewsModel};
 use crate::ai::agent::conversation::{AIConversation, AIConversationId, ConversationStatus};
 use crate::ai::agent_management::notifications::{
@@ -22,7 +23,6 @@ use crate::terminal::cli_agent_sessions::{
 use crate::terminal::CLIAgent;
 use crate::test_util::settings::initialize_settings_for_tests;
 use crate::workspace::WorkspaceRegistry;
-use crate::BlocklistAIHistoryModel;
 
 fn setup_app(
     app: &mut App,
@@ -150,9 +150,11 @@ fn add_notification_tracks_unread_activity_when_in_app_notifications_are_hidden(
                     .filtered_count(NotificationFilter::All),
                 1
             );
-            assert!(model
-                .notifications()
-                .has_unread_for_terminal_view(terminal_view_id));
+            assert!(
+                model
+                    .notifications()
+                    .has_unread_for_terminal_view(terminal_view_id)
+            );
         });
         assert_eq!(app.dock_badge_count(), 1);
     });
@@ -492,10 +494,12 @@ fn should_trigger_notification_returns_true_for_success() {
 
 #[test]
 fn should_trigger_notification_returns_true_for_blocked() {
-    assert!(ConversationStatus::Blocked {
-        blocked_action: "approve diff".to_owned(),
-    }
-    .should_trigger_notification());
+    assert!(
+        ConversationStatus::Blocked {
+            blocked_action: "approve diff".to_owned(),
+        }
+        .should_trigger_notification()
+    );
 }
 
 #[test]
