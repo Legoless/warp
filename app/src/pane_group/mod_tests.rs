@@ -1881,11 +1881,13 @@ fn test_reload_shell_replaces_terminal_with_fresh_session() {
                 .terminal_view_from_pane_id(replacement_pane_id, ctx)
                 .expect("replacement pane should have a terminal view");
             assert_ne!(replacement_terminal_view.id(), original_terminal_view_id);
-            assert!(replacement_terminal_view
-                .as_ref(ctx)
-                .model
-                .lock()
-                .is_block_list_empty());
+            assert!(
+                replacement_terminal_view
+                    .as_ref(ctx)
+                    .model
+                    .lock()
+                    .is_block_list_empty()
+            );
         });
     });
 }
